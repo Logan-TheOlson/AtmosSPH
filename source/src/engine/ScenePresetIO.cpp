@@ -159,6 +159,28 @@ const std::vector<PresetField>& Fields() {
                                 [](Scene& s, const std::string& v) { s.spawn.gridCountY = ParseInt(v, s.spawn.gridCountY); } },
         { "spawn.offsetXFrac", [](const Scene& s) { return FormatFloat(s.spawn.offsetXFrac); },
                                 [](Scene& s, const std::string& v) { s.spawn.offsetXFrac = ParseFloat(v, s.spawn.offsetXFrac); } },
+        { "spawn.fillBoundary", [](const Scene& s) { return FormatBool(s.spawn.fillBoundary); },
+                                [](Scene& s, const std::string& v) { s.spawn.fillBoundary = ParseBool(v, s.spawn.fillBoundary); } },
+        { "pattern.kind", [](const Scene& s) { return std::to_string(static_cast<int>(s.colorPattern.kind)); },
+                [](Scene& s, const std::string& v) { s.colorPattern.kind = static_cast<ColorPatternKind>(std::clamp(ParseInt(v, static_cast<int>(s.colorPattern.kind)), 0, static_cast<int>(ColorPatternKind::Image))); } },
+        { "pattern.colorA.r", [](const Scene& s) { return FormatFloat(s.colorPattern.colorA.r); },
+                [](Scene& s, const std::string& v) { s.colorPattern.colorA.r = ParseFloat(v, s.colorPattern.colorA.r); } },
+        { "pattern.colorA.g", [](const Scene& s) { return FormatFloat(s.colorPattern.colorA.g); },
+                [](Scene& s, const std::string& v) { s.colorPattern.colorA.g = ParseFloat(v, s.colorPattern.colorA.g); } },
+        { "pattern.colorA.b", [](const Scene& s) { return FormatFloat(s.colorPattern.colorA.b); },
+                [](Scene& s, const std::string& v) { s.colorPattern.colorA.b = ParseFloat(v, s.colorPattern.colorA.b); } },
+        { "pattern.colorB.r", [](const Scene& s) { return FormatFloat(s.colorPattern.colorB.r); },
+                [](Scene& s, const std::string& v) { s.colorPattern.colorB.r = ParseFloat(v, s.colorPattern.colorB.r); } },
+        { "pattern.colorB.g", [](const Scene& s) { return FormatFloat(s.colorPattern.colorB.g); },
+                [](Scene& s, const std::string& v) { s.colorPattern.colorB.g = ParseFloat(v, s.colorPattern.colorB.g); } },
+        { "pattern.colorB.b", [](const Scene& s) { return FormatFloat(s.colorPattern.colorB.b); },
+                [](Scene& s, const std::string& v) { s.colorPattern.colorB.b = ParseFloat(v, s.colorPattern.colorB.b); } },
+        { "pattern.cellSize", [](const Scene& s) { return FormatFloat(s.colorPattern.cellSize); },
+                [](Scene& s, const std::string& v) { s.colorPattern.cellSize = ParseFloat(v, s.colorPattern.cellSize); } },
+        { "pattern.imagePath", [](const Scene& s) { return s.colorPattern.imagePath; },
+                [](Scene& s, const std::string& v) { s.colorPattern.imagePath = v; } },
+        { "spawn.spacingScale", [](const Scene& s) { return FormatFloat(s.spawn.spacingScale); },
+                                 [](Scene& s, const std::string& v) { s.spawn.spacingScale = std::max(ParseFloat(v, s.spawn.spacingScale), 0.1f); } },
         { "spawn.circular",    [](const Scene& s) { return FormatBool(s.spawn.circular); },
                                 [](Scene& s, const std::string& v) { s.spawn.circular = ParseBool(v, s.spawn.circular); } },
 
@@ -182,8 +204,14 @@ const std::vector<EventField>& EventFields() {
     static const std::vector<EventField> fields = {
         { "shape",     [](const SceneEvent& e) { return std::string(e.shape == EventShape::Rect ? "Rect" : "Circle"); },
                         [](SceneEvent& e, const std::string& v) { if (v == "Rect") e.shape = EventShape::Rect; else if (v == "Circle") e.shape = EventShape::Circle; } },
-        { "mode",      [](const SceneEvent& e) { return std::string(e.mode == EventMode::Continuous ? "Continuous" : "Once"); },
-                        [](SceneEvent& e, const std::string& v) { if (v == "Continuous") e.mode = EventMode::Continuous; else if (v == "Once") e.mode = EventMode::Once; } },
+        { "mode",      [](const SceneEvent& e) { return std::string(e.mode == EventMode::Continuous ? "Continuous" : e.mode == EventMode::Field ? "Field" : "Once"); },
+                        [](SceneEvent& e, const std::string& v) { if (v == "Continuous") e.mode = EventMode::Continuous; else if (v == "Once") e.mode = EventMode::Once; else if (v == "Field") e.mode = EventMode::Field; } },
+        { "fieldKind", [](const SceneEvent& e) { return std::to_string(static_cast<int>(e.fieldKind)); },
+                        [](SceneEvent& e, const std::string& v) { e.fieldKind = static_cast<FieldKind>(std::clamp(ParseInt(v, 0), 0, 2)); } },
+        { "strength",  [](const SceneEvent& e) { return FormatFloat(e.strength); },
+                        [](SceneEvent& e, const std::string& v) { e.strength = ParseFloat(v, e.strength); } },
+        { "fade",      [](const SceneEvent& e) { return std::string(e.fade ? "1" : "0"); },
+                        [](SceneEvent& e, const std::string& v) { e.fade = v == "1" || v == "true"; } },
         { "cx",        [](const SceneEvent& e) { return FormatFloat(e.cx); },
                         [](SceneEvent& e, const std::string& v) { e.cx = ParseFloat(v, e.cx); } },
         { "cy",        [](const SceneEvent& e) { return FormatFloat(e.cy); },
@@ -226,6 +254,57 @@ bool LoadEventKey(Scene& out, const std::string& key, const std::string& value) 
     return false;
 }
 
+// Persistent-color regions: "pin.count=N" plus "pin.<i>.<field>=value", like events.
+struct PinField {
+    const char*                                                key;
+    std::function<std::string(const SceneColorRegion&)>        get;
+    std::function<void(SceneColorRegion&, const std::string&)> set;
+};
+
+const std::vector<PinField>& PinFields() {
+    static const std::vector<PinField> fields = {
+        { "shape",  [](const SceneColorRegion& r) { return std::string(r.shape == EventShape::Rect ? "Rect" : "Circle"); },
+                     [](SceneColorRegion& r, const std::string& v) { if (v == "Rect") r.shape = EventShape::Rect; else if (v == "Circle") r.shape = EventShape::Circle; } },
+        { "cx",     [](const SceneColorRegion& r) { return FormatFloat(r.cx); },
+                     [](SceneColorRegion& r, const std::string& v) { r.cx = ParseFloat(v, r.cx); } },
+        { "cy",     [](const SceneColorRegion& r) { return FormatFloat(r.cy); },
+                     [](SceneColorRegion& r, const std::string& v) { r.cy = ParseFloat(v, r.cy); } },
+        { "radius", [](const SceneColorRegion& r) { return FormatFloat(r.radius); },
+                     [](SceneColorRegion& r, const std::string& v) { r.radius = ParseFloat(v, r.radius); } },
+        { "halfW",  [](const SceneColorRegion& r) { return FormatFloat(r.halfW); },
+                     [](SceneColorRegion& r, const std::string& v) { r.halfW = ParseFloat(v, r.halfW); } },
+        { "halfH",  [](const SceneColorRegion& r) { return FormatFloat(r.halfH); },
+                     [](SceneColorRegion& r, const std::string& v) { r.halfH = ParseFloat(v, r.halfH); } },
+        { "r",      [](const SceneColorRegion& r) { return FormatFloat(r.color.r); },
+                     [](SceneColorRegion& r, const std::string& v) { r.color.r = ParseFloat(v, r.color.r); } },
+        { "g",      [](const SceneColorRegion& r) { return FormatFloat(r.color.g); },
+                     [](SceneColorRegion& r, const std::string& v) { r.color.g = ParseFloat(v, r.color.g); } },
+        { "b",      [](const SceneColorRegion& r) { return FormatFloat(r.color.b); },
+                     [](SceneColorRegion& r, const std::string& v) { r.color.b = ParseFloat(v, r.color.b); } },
+        { "a",      [](const SceneColorRegion& r) { return FormatFloat(r.color.a); },
+                     [](SceneColorRegion& r, const std::string& v) { r.color.a = ParseFloat(v, r.color.a); } },
+    };
+    return fields;
+}
+
+bool LoadPinKey(Scene& out, const std::string& key, const std::string& value) {
+    if (key.rfind("pin.", 0) != 0) return false;
+    const std::string rest = key.substr(4);
+    if (rest == "count") {
+        out.colorRegions.resize(static_cast<size_t>(std::clamp(ParseInt(value, 0), 0, 1024)));
+        return true;
+    }
+    const size_t dot = rest.find('.');
+    if (dot == std::string::npos) return false;
+    const int idx = ParseInt(rest.substr(0, dot), -1);
+    if (idx < 0 || idx >= 1024) return true;
+    if (static_cast<size_t>(idx) >= out.colorRegions.size()) out.colorRegions.resize(static_cast<size_t>(idx) + 1);
+    const std::string field = rest.substr(dot + 1);
+    for (const auto& f : PinFields())
+        if (field == f.key) { f.set(out.colorRegions[static_cast<size_t>(idx)], value); return true; }
+    return false;
+}
+
 } // namespace
 
 bool SaveScenePreset(const std::filesystem::path& path, const Scene& scene) {
@@ -237,6 +316,10 @@ bool SaveScenePreset(const std::filesystem::path& path, const Scene& scene) {
     for (size_t i = 0; i < scene.events.size(); i++)
         for (const auto& f : EventFields())
             out << "event." << i << '.' << f.key << '=' << f.get(scene.events[i]) << '\n';
+    out << "pin.count=" << scene.colorRegions.size() << '\n';
+    for (size_t i = 0; i < scene.colorRegions.size(); i++)
+        for (const auto& f : PinFields())
+            out << "pin." << i << '.' << f.key << '=' << f.get(scene.colorRegions[i]) << '\n';
     return true;
 }
 
@@ -256,7 +339,7 @@ bool LoadScenePreset(const std::filesystem::path& path, Scene& out) {
             [&](const PresetField& f) { return key == f.key; });
         if (it != fields.end())
             it->set(out, value);
-        else if (!LoadEventKey(out, key, value))
+        else if (!LoadEventKey(out, key, value) && !LoadPinKey(out, key, value))
             std::cerr << "LoadScenePreset: unknown key '" << key << "' in " << path << ", skipping\n";
     }
     return true;

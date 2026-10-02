@@ -40,8 +40,23 @@ public:
     // Live (non-batch) recording never actually hits this divergence — a swapchain resize there
     // stops the recording outright (see RecreateSwapchain) before hw/hh can drift — but pinning
     // unconditionally whenever IsRecording() is simpler than special-casing which capture mode.
-    float RecordingHalfWidth()  const { return recorder_.IsActive() ? recordWidth_  * 0.5f : HalfWidth(); }
-    float RecordingHalfHeight() const { return recorder_.IsActive() ? recordHeight_ * 0.5f : HalfHeight(); }
+    float RecordingHalfWidth()  const { return recorder_.IsActive() ? recordWidth_  * 0.5f : UsesSceneViewport() ? sceneViewport_.w * 0.5f : HalfWidth(); }
+    float RecordingHalfHeight() const { return recorder_.IsActive() ? recordHeight_ * 0.5f : UsesSceneViewport() ? sceneViewport_.h * 0.5f : HalfHeight(); }
+
+    // Restricts where the live (swapchain) scene pass draws to this framebuffer-pixel rect — the
+    // free area left in the middle of the docked UI panels — with the world origin at the rect's
+    // center instead of the window's. w/h = 0 means the full window. Ignored (full window) while a
+    // recording is active: live capture reads the swapchain image from (0,0), and offscreen batch
+    // rendering never goes through this path at all. See RecordingHalfWidth/Height.
+    struct SceneViewport { float x = 0.f, y = 0.f, w = 0.f, h = 0.f; };
+    void SetSceneViewport(float x, float y, float w, float h) { sceneViewport_ = { x, y, w, h }; }
+    bool UsesSceneViewport() const { return sceneViewport_.w > 0.f && sceneViewport_.h > 0.f && !recorder_.IsActive(); }
+    // Center of the rect the live scene is drawn into, in framebuffer pixels (window center if
+    // the viewport isn't in use) — the world origin on screen.
+    void SceneCenterPx(float& cx, float& cy) const {
+        if (UsesSceneViewport()) { cx = sceneViewport_.x + sceneViewport_.w * 0.5f; cy = sceneViewport_.y + sceneViewport_.h * 0.5f; }
+        else                     { cx = HalfWidth(); cy = HalfHeight(); }
+    }
 
     // Captures the composited (scene + UI) swapchain image at `fps`, pacing capture against real
     // time (via RenderFrame's dt) rather than the render loop's actual rate. lengthSeconds <= 0
@@ -175,6 +190,7 @@ private:
     std::vector<CircleData> circles;
     std::vector<RectData>   rects;
 
+    SceneViewport   sceneViewport_{};
     bool            profilerOpen_{ false };
     Profiler::Stats profilerStats_{};
     int             objectCount_{ 0 };
@@ -229,7 +245,8 @@ private:
     // (swapchainMsaaView/offscreenMsaaView) and `resolveView` the final single-sample image the
     // multisampled result resolves into as part of this same pass; the MSAA image itself is left
     // DONT_CARE since nothing ever reads it back.
-    void RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent);
+    void RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent,
+                         const SceneViewport* viewport = nullptr);
     void CreateShapePipeline(const char* vertSpv, const char* fragSpv,
                              VkDescriptorSetLayout descSetLayout,
                              VkPipelineLayout& outLayout, VkPipeline& outPipeline);

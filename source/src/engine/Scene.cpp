@@ -96,31 +96,22 @@ namespace {
         return s;
     }
 
-    // A container completely packed with fluid and no forces at all (no gravity, no external
-    // force): nothing happens until an event (see SceneEvent) kicks part of it. Sized from the
-    // particle grid like Poiseuille so the lattice fills the box wall to wall.
-    Scene MakeEventBox(int gridCountX = 100, int gridCountY = 60) {
-        Scene s = MakeOpenTank(gridCountX, gridCountY);
-        s.name        = "Event Box";
-        s.description = "A box completely packed with fluid and no gravity; scheduled or live "
-                         "events push particles inside an area.";
-        s.physics.force = Vec2(0.f, 0.f);
-        const float spacing = s.particles.circleRadius * 3.0f; // must match Init()'s spacing
-        s.boundary.halfWidthPx  = 0.5f * static_cast<float>(gridCountX) * spacing;
-        s.boundary.halfHeightPx = 0.5f * static_cast<float>(gridCountY) * spacing;
-        // Same lattice-sum rest density as Poiseuille (spacing 9, h = 15), so the packed block
-        // starts at rest instead of over-compressed.
+    // Same container as Open Tank (the full window and walls, but no gravity), but the lattice is
+    // sized by Init() (SceneSpawn::fillBoundary) to fill it wall to wall instead of a centered block.
+    Scene MakePacked() {
+        Scene s = MakeOpenTank();
+        s.name        = "Packed";
+        s.description = "Full-window box completely packed with fluid, no gravity; the count is "
+                         "whatever fills the window.";
+        s.spawn.fillBoundary = true;
+        // Slightly over-packed: lattice spacing 0.92x the rest spacing (+~18% particles, ~1.18x the
+        // rest density), so the fluid starts under positive pressure and fills the box with
+        // essentially no gaps. Done through particle count only -- targetDensity is untouched.
+        s.spawn.spacingScale = 0.92f;
+        s.physics.force = Vec2(0.f, 0.f); // no gravity: the packed fluid just sits until something (e.g. an event) moves it
+        // Lattice-sum rest density at spacing 9, h = 15 (see the old Poiseuille/Event Box notes),
+        // so the packed block starts at rest instead of over-compressed.
         s.particles.targetDensity = 1.20895e-2f;
-        s.realTimeLimitX = 100;
-        s.realTimeLimitY = 60;
-
-        SceneEvent kick;
-        kick.shape     = EventShape::Circle;
-        kick.mode      = EventMode::Once;
-        kick.radius    = 80.f;
-        kick.accel     = Vec2(400.f, 0.f);
-        kick.startTime = 1.f;
-        s.events.push_back(kick);
         return s;
     }
 
@@ -257,7 +248,7 @@ namespace {
 }
 
 const std::vector<Scene> ScenePresets = {
-    MakeOpenTank(), MakePoiseuille(), MakeSelfGravity(), MakeEventBox(),
+    MakeOpenTank(), MakePoiseuille(), MakeSelfGravity(), MakePacked(),
 };
 
 Scene BuildScene(int presetIndex, int gridCountX, int gridCountY) {
@@ -267,7 +258,7 @@ Scene BuildScene(int presetIndex, int gridCountX, int gridCountY) {
         case 0:  return MakeOpenTank(gridCountX, gridCountY);
         case 1:  return MakePoiseuille(gridCountX, gridCountY);
         case 2:  return MakeSelfGravity(gridCountX, gridCountY);
-        case 3:  return MakeEventBox(gridCountX, gridCountY);
+        case 3:  return MakePacked();
         default: return ScenePresets[presetIndex];
     }
 }

@@ -1,6 +1,8 @@
 #pragma once
 #include "Config.h"
 #include "util/Vector.h"
+#include <algorithm>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -119,13 +121,24 @@ struct SceneSpawn {
     int   gridCountY  = 100;
     float offsetXFrac = 0.0f;
     bool  circular     = false;
+    // If set, Init() ignores gridCountX/Y and packs the lattice wall to wall into the boundary
+    // (whatever its size resolves to), writing the resulting counts back into gridCountX/Y.
+    bool  fillBoundary = false;
+    // Lattice spacing as a multiple of the default (3 * circleRadius). < 1 packs more particles into
+    // the same area than the rest density calls for, i.e. starts the fluid compressed (positive
+    // pressure); the particle count rises by 1 / spacingScale^2.
+    float spacingScale = 1.f;
 };
 
 // A sudden acceleration applied to every particle inside an area. Circle/Rect pick the area's
 // shape; Continuous applies `accel` (px/s^2) every substep while the event is active, Once adds
 // `accel` (px/s) to the velocity of everything inside, a single time, when startTime is reached.
 enum class EventShape { Circle, Rect };
-enum class EventMode  { Continuous, Once };
+// Field: a continuous position-dependent acceleration (see EventFieldAccel) instead of one uniform push.
+enum class EventMode  { Continuous, Once, Field };
+// Field shapes: Curl swirls counter-clockwise around the area's center (negative strength = clockwise),
+// Attract pulls toward it, Repel pushes away.
+enum class FieldKind  { Curl, Attract, Repel };
 
 struct SceneEvent {
     EventShape shape = EventShape::Circle;
@@ -136,7 +149,59 @@ struct SceneEvent {
     float halfW = 100.f, halfH = 100.f;  // Rect
     Vec2  accel = Vec2(0.f, 0.f);        // Continuous: px/s^2.  Once: px/s velocity delta.
     float startTime = 0.f;               // simulated seconds since the run started
-    float duration  = 0.f;               // Continuous only; 0 = until the run ends
+    float duration  = 0.f;               // Continuous/Field only; 0 = until the run ends
+    FieldKind fieldKind = FieldKind::Curl; // Field only
+    float strength  = 400.f;             // Field only: acceleration magnitude, px/s^2
+    bool  fade      = false;             // Field only: full strength at the center, falling to 0 at the edge
+};
+
+// Field acceleration at world point (px, py) for a Field-mode event; false if the point is outside
+// the area. Zero exactly at the center (direction undefined there).
+inline bool EventFieldAccel(const SceneEvent& e, float px, float py, float& ax, float& ay) {
+    const float dx = px - e.cx, dy = py - e.cy;
+    float edge; // 0 at the center -> 1 at the boundary
+    if (e.shape == EventShape::Circle) {
+        const float d2 = dx * dx + dy * dy;
+        if (d2 > e.radius * e.radius) return false;
+        edge = e.radius > 0.f ? std::sqrt(d2) / e.radius : 0.f;
+    } else {
+        if (std::fabs(dx) > e.halfW || std::fabs(dy) > e.halfH) return false;
+        edge = std::max(e.halfW > 0.f ? std::fabs(dx) / e.halfW : 0.f, e.halfH > 0.f ? std::fabs(dy) / e.halfH : 0.f);
+    }
+    ax = ay = 0.f;
+    const float dist = std::sqrt(dx * dx + dy * dy);
+    if (dist < 1e-4f) return true;
+    const float mag = e.strength * (e.fade ? 1.f - edge : 1.f);
+    const float ux = dx / dist, uy = dy / dist;
+    switch (e.fieldKind) {
+        case FieldKind::Curl:    ax = -uy * mag; ay =  ux * mag; break;
+        case FieldKind::Attract: ax = -ux * mag; ay = -uy * mag; break;
+        case FieldKind::Repel:   ax =  ux * mag; ay =  uy * mag; break;
+    }
+    return true;
+}
+
+// A persistent-color patch: every particle whose *spawn* position lies inside the area keeps `color`
+// for the whole run unless a live color-by mode (Engine.cpp) overrides it. Coordinates
+// are world pixels (origin = window center, +y up), same as SceneEvent. Later regions win overlaps.
+struct SceneColorRegion {
+    EventShape shape = EventShape::Rect;
+    float cx = 0.f, cy = 0.f;
+    float radius = 100.f;                // Circle
+    float halfW = 100.f, halfH = 100.f;  // Rect
+    Color color = { 1.f, 0.3f, 0.2f, 1.f };
+};
+
+// A persistent-color pattern laid over the whole spawn block (before SceneColorRegions, which win where
+// they overlap). Like regions, colors are assigned at spawn and never change during the run.
+enum class ColorPatternKind { None, VStripes, HStripes, Checker, Rings, Gradient, Image };
+
+struct SceneColorPattern {
+    ColorPatternKind kind = ColorPatternKind::None;
+    Color colorA = { 1.f, 0.35f, 0.25f, 1.f };
+    Color colorB = { 0.25f, 0.55f, 1.f, 1.f };
+    float cellSize = 60.f;       // px: stripe width / checker cell / ring spacing (unused by Gradient/Image)
+    std::string imagePath;       // Image: PNG/BMP, scaled to fit the spawn block (aspect kept); transparent pixels stay unpinned
 };
 
 struct Scene {
@@ -159,6 +224,8 @@ struct Scene {
     int             realTimeLimitY = 0;
 
     std::vector<SceneEvent> events;
+    std::vector<SceneColorRegion> colorRegions;
+    SceneColorPattern colorPattern;
 };
 
 extern const std::vector<Scene> ScenePresets;

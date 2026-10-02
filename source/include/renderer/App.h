@@ -30,6 +30,9 @@ public:
     // should use instead of HalfWidth()/HalfHeight() while a recording is active.
     float RecordingHalfWidth()  const { return vk.RecordingHalfWidth(); }
     float RecordingHalfHeight() const { return vk.RecordingHalfHeight(); }
+    // See VulkanContext::SetSceneViewport / SceneCenterPx (framebuffer pixels).
+    void  SetSceneViewport(float x, float y, float w, float h) { vk.SetSceneViewport(x, y, w, h); }
+    void  SceneCenterPx(float& cx, float& cy) const { vk.SceneCenterPx(cx, cy); }
 
     // Starts (or restarts) recording the composited frame to <recordingsDir>/<title>.mp4 via
     // ffmpeg. lengthSeconds <= 0 means "until StopRecording() is called".

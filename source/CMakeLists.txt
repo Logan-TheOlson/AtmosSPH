@@ -5,7 +5,7 @@ project(${NAME})
 include(FetchContent)
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui
-    GIT_TAG        master
+    GIT_TAG        docking
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(imgui)
@@ -109,12 +109,15 @@ add_executable(${NAME}
     src/renderer/App.cpp
     src/renderer/Window.cpp
     src/renderer/VulkanContext.cpp
+    src/ui/Workspace.cpp
+    src/ui/EventGizmo.cpp
     src/util/Profiler.cpp
     src/util/ThreadPool.cpp
     src/util/Recorder.cpp
     src/util/DataRecorder.cpp
     src/util/RunNaming.cpp
     src/util/Vector.cpp
+    src/util/ColorPattern.cpp
     src/physics/GravityParams.cpp
     src/physics/Quadtree.cpp
     src/physics/Gravity.cpp

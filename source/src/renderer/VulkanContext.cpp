@@ -6,6 +6,7 @@
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
 #include <algorithm>
+#include "ui/Theme.h"
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -176,95 +177,95 @@ bool VulkanContext::Init(SDL_Window* window) {
     return true;
 }
 
-// Flat, softly-rounded theme — replaces ImGui's default sharp corners and saturated blue-on-gray
-// palette, which read as a debug overlay rather than an app UI. GUI panel color (#6f6a61) is kept
-// distinct from the sim canvas clear color (#2b3444, see RenderFrame) so the UI chrome reads as a
-// panel sitting on top of the canvas rather than one continuous surface.
+// Flat, softly-rounded dark theme built from ui/Theme.h's palette (slate surfaces, periwinkle
+// accent). The UI panels are a lighter shade than the sim canvas (Theme::Canvas, also the scene
+// pass's clear color) so they read as surfaces sitting on top of it.
 static void ApplyModernStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
 
-    style.WindowRounding    = 12.0f;
-    style.ChildRounding     = 10.0f;
-    style.FrameRounding     = 8.0f;
-    style.PopupRounding     = 10.0f;
-    style.ScrollbarRounding = 10.0f;
-    style.GrabRounding      = 8.0f;
-    style.TabRounding       = 8.0f;
+    style.WindowRounding    = 14.0f;
+    style.ChildRounding     = 12.0f;
+    style.FrameRounding     = 10.0f;
+    style.PopupRounding     = 12.0f;
+    style.ScrollbarRounding = 12.0f;
+    style.GrabRounding      = 10.0f;
+    style.TabRounding       = 10.0f;
     style.WindowBorderSize  = 0.0f;
+    style.ChildBorderSize   = 0.0f;
     style.FrameBorderSize   = 0.0f;
     style.PopupBorderSize   = 0.0f;
+    style.TabBorderSize     = 0.0f;
     style.WindowPadding     = ImVec2(14.f, 14.f);
     style.FramePadding      = ImVec2(10.f, 6.f);
     style.ItemSpacing       = ImVec2(10.f, 8.f);
     style.ItemInnerSpacing  = ImVec2(8.f, 6.f);
-    style.ScrollbarSize     = 14.f;
+    style.ScrollbarSize     = 12.f;
     style.GrabMinSize       = 10.f;
+    style.SeparatorTextBorderSize = 1.f;
+    style.DockingSeparatorSize    = 3.f;
     style.ScaleAllSizes(1.2f); // a tad bigger overall — bigger windows, padding, controls, grips
 
-    const ImVec4 bg        (0.263f, 0.251f, 0.227f, 1.00f); // #43403a — darkened gui background
-    const ImVec4 bgAlt     (0.313f, 0.301f, 0.277f, 1.00f); // lighter panel/popup shade
-    const ImVec4 field     (0.353f, 0.341f, 0.317f, 1.00f); // input/button fill
-    const ImVec4 fieldHov  (0.413f, 0.401f, 0.377f, 1.00f);
-    const ImVec4 accent    (0.659f, 0.569f, 0.427f, 1.00f); // warm tan/taupe
-    const ImVec4 accentHov (0.749f, 0.663f, 0.518f, 1.00f);
-    const ImVec4 accentAct (0.545f, 0.463f, 0.333f, 1.00f);
-    const ImVec4 text      (0.737f, 0.702f, 0.647f, 1.00f); // #bcb3a5 — text
-    const ImVec4 textDim   (0.453f, 0.453f, 0.457f, 1.00f); // muted text, blended toward canvas bg
-    const ImVec4 headerBase(0.659f, 0.569f, 0.427f, 0.35f);
-    const ImVec4 headerHov (0.659f, 0.569f, 0.427f, 0.55f);
-    const ImVec4 headerAct (0.659f, 0.569f, 0.427f, 0.70f);
+    using namespace Theme;
+    const ImVec4 headerBase = WithAlpha(Accent, 0.28f);
+    const ImVec4 headerHov  = WithAlpha(Accent, 0.45f);
+    const ImVec4 headerAct  = WithAlpha(Accent, 0.60f);
 
     ImVec4* c = style.Colors;
-    c[ImGuiCol_Text]                 = text;
-    c[ImGuiCol_TextDisabled]         = textDim;
-    c[ImGuiCol_WindowBg]             = bg;
+    c[ImGuiCol_Text]                 = Text;
+    c[ImGuiCol_TextDisabled]         = TextDim;
+    c[ImGuiCol_WindowBg]             = Panel;
     c[ImGuiCol_ChildBg]              = ImVec4(0.f, 0.f, 0.f, 0.f);
-    c[ImGuiCol_PopupBg]              = bgAlt;
-    c[ImGuiCol_Border]               = ImVec4(1.f, 1.f, 1.f, 0.06f);
-    c[ImGuiCol_FrameBg]              = field;
-    c[ImGuiCol_FrameBgHovered]       = fieldHov;
-    c[ImGuiCol_FrameBgActive]        = fieldHov;
-    c[ImGuiCol_TitleBg]              = bgAlt;
-    c[ImGuiCol_TitleBgActive]        = bgAlt;
-    c[ImGuiCol_TitleBgCollapsed]     = bgAlt;
-    c[ImGuiCol_MenuBarBg]            = bgAlt;
+    c[ImGuiCol_PopupBg]              = PanelAlt;
+    c[ImGuiCol_Border]               = ImVec4(1.f, 1.f, 1.f, 0.07f);
+    c[ImGuiCol_FrameBg]              = Field;
+    c[ImGuiCol_FrameBgHovered]       = FieldHov;
+    c[ImGuiCol_FrameBgActive]        = FieldHov;
+    c[ImGuiCol_TitleBg]              = Panel;
+    c[ImGuiCol_TitleBgActive]        = Panel;
+    c[ImGuiCol_TitleBgCollapsed]     = Panel;
+    c[ImGuiCol_MenuBarBg]            = PanelAlt;
     c[ImGuiCol_ScrollbarBg]          = ImVec4(0.f, 0.f, 0.f, 0.f);
-    c[ImGuiCol_ScrollbarGrab]        = field;
-    c[ImGuiCol_ScrollbarGrabHovered] = fieldHov;
-    c[ImGuiCol_ScrollbarGrabActive]  = accent;
-    c[ImGuiCol_CheckMark]            = accent;
-    c[ImGuiCol_SliderGrab]           = accent;
-    c[ImGuiCol_SliderGrabActive]     = accentHov;
-    c[ImGuiCol_Button]               = field;
-    c[ImGuiCol_ButtonHovered]        = fieldHov;
-    c[ImGuiCol_ButtonActive]         = accentAct;
+    c[ImGuiCol_ScrollbarGrab]        = Field;
+    c[ImGuiCol_ScrollbarGrabHovered] = FieldHov;
+    c[ImGuiCol_ScrollbarGrabActive]  = Accent;
+    c[ImGuiCol_CheckMark]            = Accent;
+    c[ImGuiCol_SliderGrab]           = Accent;
+    c[ImGuiCol_SliderGrabActive]     = AccentHov;
+    c[ImGuiCol_Button]               = Field;
+    c[ImGuiCol_ButtonHovered]        = FieldHov;
+    c[ImGuiCol_ButtonActive]         = AccentAct;
     c[ImGuiCol_Header]               = headerBase;
     c[ImGuiCol_HeaderHovered]        = headerHov;
     c[ImGuiCol_HeaderActive]         = headerAct;
     c[ImGuiCol_Separator]            = ImVec4(1.f, 1.f, 1.f, 0.08f);
-    c[ImGuiCol_SeparatorHovered]     = accent;
-    c[ImGuiCol_SeparatorActive]      = accentHov;
+    c[ImGuiCol_SeparatorHovered]     = Accent;
+    c[ImGuiCol_SeparatorActive]      = AccentHov;
     c[ImGuiCol_ResizeGrip]           = ImVec4(1.f, 1.f, 1.f, 0.04f);
-    c[ImGuiCol_ResizeGripHovered]    = accent;
-    c[ImGuiCol_ResizeGripActive]     = accentHov;
-    c[ImGuiCol_Tab]                  = bgAlt;
-    c[ImGuiCol_TabHovered]           = fieldHov;
-    c[ImGuiCol_TabActive]            = field;
-    c[ImGuiCol_TabUnfocused]         = bgAlt;
-    c[ImGuiCol_TabUnfocusedActive]   = field;
-    c[ImGuiCol_PlotLines]            = accent;
-    c[ImGuiCol_PlotLinesHovered]     = accentHov;
-    c[ImGuiCol_PlotHistogram]        = accent;
-    c[ImGuiCol_PlotHistogramHovered] = accentHov;
+    c[ImGuiCol_ResizeGripHovered]    = Accent;
+    c[ImGuiCol_ResizeGripActive]     = AccentHov;
+    c[ImGuiCol_Tab]                  = PanelAlt;
+    c[ImGuiCol_TabHovered]           = headerHov;
+    c[ImGuiCol_TabSelected]          = WithAlpha(Accent, 0.35f);
+    c[ImGuiCol_TabSelectedOverline]  = Accent;
+    c[ImGuiCol_TabDimmed]            = PanelAlt;
+    c[ImGuiCol_TabDimmedSelected]    = Field;
+    c[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(0.f, 0.f, 0.f, 0.f);
+    c[ImGuiCol_DockingPreview]       = WithAlpha(Accent, 0.45f);
+    c[ImGuiCol_DockingEmptyBg]       = Canvas;
+    c[ImGuiCol_PlotLines]            = Accent;
+    c[ImGuiCol_PlotLinesHovered]     = AccentHov;
+    c[ImGuiCol_PlotHistogram]        = Accent;
+    c[ImGuiCol_PlotHistogramHovered] = AccentHov;
     c[ImGuiCol_TextSelectedBg]       = headerBase;
-    c[ImGuiCol_DragDropTarget]       = accent;
-    c[ImGuiCol_NavHighlight]         = accent;
+    c[ImGuiCol_DragDropTarget]       = Accent;
+    c[ImGuiCol_NavCursor]            = Accent;
 }
 
 void VulkanContext::InitImGui(SDL_Window* window) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     ApplyModernStyle();
 
     // Default ImGui font is a small bitmap font (ProggyClean) — crisp at its one fixed size but
@@ -365,7 +366,8 @@ void VulkanContext::RecreateSwapchain() {
 // `drawView` at `extent` (resolving into `resolveView` if it's not VK_NULL_HANDLE — see the header
 // comment) and clears both vectors. Must run between vkCmdBeginCommandBuffer and the caller's own
 // barriers/vkCmdEndCommandBuffer.
-void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent) {
+void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent,
+                                    const SceneViewport* vp) {
     const bool msaa = resolveView != VK_NULL_HANDLE;
     VkRenderingAttachmentInfo att{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -377,7 +379,7 @@ void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveVie
         // The MSAA attachment itself is transient — only the resolved output (resolveView) is ever
         // read again — so DONT_CARE saves the driver from actually writing it back to memory.
         .storeOp = msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = { .color = { .float32 = { 0.169f, 0.204f, 0.267f, 1.0f } } }, // #2b3444
+        .clearValue = { .color = { .float32 = { Theme::Canvas.x, Theme::Canvas.y, Theme::Canvas.z, 1.0f } } }, // Theme::Canvas
     };
     VkRenderingInfo ri{
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -386,12 +388,22 @@ void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveVie
     };
     vkCmdBeginRendering(cb, &ri);
     {
+        // A sub-rect viewport (the docked UI's free center area) re-centers the world origin in it
+        // and, since invScreen below is derived from the same size, keeps 1 world unit = 1 pixel.
         VkViewport viewport{ 0, 0, (float)extent.width, (float)extent.height, 0.0f, 1.0f };
         VkRect2D   scissor{ {0,0}, extent };
+        float vw = (float)extent.width, vh = (float)extent.height;
+        if (vp) {
+            const float x0 = std::clamp(vp->x, 0.f, vw - 1.f), y0 = std::clamp(vp->y, 0.f, vh - 1.f);
+            const float x1 = std::clamp(vp->x + vp->w, x0 + 1.f, vw), y1 = std::clamp(vp->y + vp->h, y0 + 1.f, vh);
+            viewport = { x0, y0, x1 - x0, y1 - y0, 0.0f, 1.0f };
+            scissor  = { { (int32_t)x0, (int32_t)y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } };
+            vw = x1 - x0; vh = y1 - y0;
+        }
         vkCmdSetViewport(cb, 0, 1, &viewport);
         vkCmdSetScissor(cb, 0, 1, &scissor);
 
-        float invScreen[2] = { 2.0f / extent.width, 2.0f / extent.height };
+        float invScreen[2] = { 2.0f / vw, 2.0f / vh };
 
         if (!circles.empty()) {
             const uint32_t n = (uint32_t)circles.size();
@@ -776,7 +788,7 @@ void VulkanContext::RenderFrame(float dt) {
     // everything downstream of this call keeps reading imageViews[imageIndex] exactly as before.
     RecordScenePass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? swapchainMsaaView : imageViews[imageIndex],
                     sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? imageViews[imageIndex] : VK_NULL_HANDLE,
-                    swapchainExtent);
+                    swapchainExtent, UsesSceneViewport() ? &sceneViewport_ : nullptr);
 
     if (capturingThisFrame) {
         VkImageMemoryBarrier toTransferSrc{

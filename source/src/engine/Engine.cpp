@@ -1,7 +1,15 @@
-﻿#include "engine/Engine.h"
+﻿#include <imgui_internal.h>
+#include <SDL3/SDL.h>
+#include <mutex>
+#include "util/ColorPattern.h"
+#include "engine/Engine.h"
 #include "engine/Scene.h"
 #include "engine/ScenePresetIO.h"
 #include "renderer/App.h"
+#include "ui/EventGizmo.h"
+#include "ui/Theme.h"
+#include "ui/Widgets.h"
+#include "ui/Workspace.h"
 #include "util/DataRecorder.h"
 #include "util/Filename.h"
 #include "util/Profiler.h"
@@ -11,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -259,7 +268,7 @@ struct ProfileLogger {
                << "# N=" << objects.size() << '\n'
                << "# gridCountX=" << s.spawn.gridCountX << '\n'
                << "# gridCountY=" << s.spawn.gridCountY << '\n'
-               << "# spacing=" << p.circleRadius * 3.f << '\n'
+               << "# spacing=" << p.circleRadius * 3.f * s.spawn.spacingScale << '\n'
                << "# h=" << p.smoothingRadius << '\n'
                << "# eos=" << (p.eos == EosModel::WCSPH ? "WCSPH" : "Polytropic") << '\n'
                << "# stiffness=" << p.stiffness << '\n'
@@ -426,6 +435,43 @@ static void FormRow(float contentWidth, const char* label) {
 static void DrawSpawnSection(SceneSpawn& spawn, float contentWidth) {
     FormRow(contentWidth, "Offset X (frac)");
     ImGui::SliderFloat("##Offset X (frac)", &spawn.offsetXFrac, -1.f, 1.f, "%.2f");
+    FormRow(contentWidth, "Packing (spacing x)");
+    ImGui::SliderFloat("##Packing (spacing x)", &spawn.spacingScale, 0.7f, 1.2f, "%.2f");
+}
+
+// Persistent-color patches (see SceneColorRegion): particles spawned inside keep the color all run.
+// Edited in the setup view like events: right-panel tab + drag gizmo (see DrawColorRegionsPanel).
+static SceneColorRegion placeRegionTemplate;
+static int              selectedRegion = -1;
+// True on frames where the "Persistent Color" window is the visible tab of the right dock node.
+static bool             colorsTabActive = false;
+
+static void DrawColorRegionFields(SceneColorRegion& r, float contentWidth) {
+    static const char* ShapeNames[] = { "Circle", "Rect" };
+    int shape = static_cast<int>(r.shape);
+    FormRow(contentWidth, "Shape");
+    if (ImGui::Combo("##Shape", &shape, ShapeNames, 2)) r.shape = static_cast<EventShape>(shape);
+    FormRow(contentWidth, "Center X (px)");
+    ImGui::InputFloat("##cx", &r.cx);
+    FormRow(contentWidth, "Center Y (px)");
+    ImGui::InputFloat("##cy", &r.cy);
+    if (r.shape == EventShape::Circle) {
+        FormRow(contentWidth, "Radius (px)");
+        ImGui::InputFloat("##radius", &r.radius);
+        r.radius = std::max(r.radius, 0.f);
+    } else {
+        FormRow(contentWidth, "Half-width (px)");
+        ImGui::InputFloat("##hw", &r.halfW);
+        FormRow(contentWidth, "Half-height (px)");
+        ImGui::InputFloat("##hh", &r.halfH);
+        r.halfW = std::max(r.halfW, 0.f);
+        r.halfH = std::max(r.halfH, 0.f);
+    }
+    const float swatchSize = ImGui::GetFrameHeight();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Color");
+    ImGui::SameLine(contentWidth - swatchSize);
+    ImGui::ColorEdit4("##color", &r.color.r, ImGuiColorEditFlags_NoInputs);
 }
 
 static void DrawBoundarySection(SceneBoundary& b, float contentWidth) {
@@ -543,8 +589,7 @@ static void DrawParticlesSection(SceneParticles& pr, float contentWidth) {
 static void Integrate(float subDt);
 
 // ---- Events (see SceneEvent) -------------------------------------------------------------------
-static bool       showEventAreas     = true;  // draw event areas over the live view (never when recording)
-static bool       placeEventArmed    = false; // Running overlay: next sim-view click creates an event
+static bool       showEventAreas     = true;  // draw event gizmos over the live view (ImGui only, never recorded)
 static SceneEvent placeEventTemplate = [] { SceneEvent e; e.accel = Vec2(400.f, 0.f); return e; }();
 // Whether each ActiveScene.events[i] of mode Once has already fired this run. Kept parallel to the
 // live list (the live editor inserts/erases in step) and reset by ResetSimulation.
@@ -573,8 +618,13 @@ static void ApplyOnceEvents() {
 // straight onto vel (not acc) because acc is only zeroed/recomputed every forceInterval substeps.
 static void ApplyContinuousEvents(double t, float subDt) {
     for (const SceneEvent& e : ActiveScene.events) {
-        if (e.mode != EventMode::Continuous || t < e.startTime) continue;
+        if ((e.mode != EventMode::Continuous && e.mode != EventMode::Field) || t < e.startTime) continue;
         if (e.duration > 0.f && t >= static_cast<double>(e.startTime) + e.duration) continue;
+        if (e.mode == EventMode::Field) {
+            for (auto& obj : objects)
+                if (float ax, ay; EventFieldAccel(e, obj.pos.x, obj.pos.y, ax, ay)) obj.vel += Vec2(ax, ay) * subDt;
+            continue;
+        }
         const Vec2 dv = e.accel * subDt;
         for (auto& obj : objects)
             if (InsideEvent(e, obj.pos)) obj.vel += dv;
@@ -582,14 +632,15 @@ static void ApplyContinuousEvents(double t, float subDt) {
 }
 
 static const char* EventShapeNames[] = { "Circle", "Rect" };
-static const char* EventModeNames[]  = { "Continuous (acceleration)", "Once (velocity kick)" };
+static const char* EventModeNames[]  = { "Continuous (acceleration)", "Once (velocity kick)", "Vector field" };
+static const char* FieldKindNames[]  = { "Curl (swirl)", "Attract (to center)", "Repel (from center)" };
 
 static void DrawEventFields(SceneEvent& e, float contentWidth) {
     int shape = static_cast<int>(e.shape), mode = static_cast<int>(e.mode);
     FormRow(contentWidth, "Shape");
     if (ImGui::Combo("##Shape", &shape, EventShapeNames, 2)) e.shape = static_cast<EventShape>(shape);
     FormRow(contentWidth, "Mode");
-    if (ImGui::Combo("##Mode", &mode, EventModeNames, 2)) e.mode = static_cast<EventMode>(mode);
+    if (ImGui::Combo("##Mode", &mode, EventModeNames, 3)) e.mode = static_cast<EventMode>(mode);
 
     FormRow(contentWidth, "Center X (px)");
     ImGui::InputFloat("##Center X (px)", &e.cx);
@@ -609,10 +660,19 @@ static void DrawEventFields(SceneEvent& e, float contentWidth) {
     }
 
     const bool once = e.mode == EventMode::Once;
-    FormRow(contentWidth, once ? "Velocity kick X (px/s)" : "Accel X (px/s^2)");
-    ImGui::InputFloat("##Event X", &e.accel.x);
-    FormRow(contentWidth, once ? "Velocity kick Y (px/s)" : "Accel Y (px/s^2)");
-    ImGui::InputFloat("##Event Y", &e.accel.y);
+    if (e.mode == EventMode::Field) {
+        int kind = static_cast<int>(e.fieldKind);
+        FormRow(contentWidth, "Field");
+        if (ImGui::Combo("##Field kind", &kind, FieldKindNames, 3)) e.fieldKind = static_cast<FieldKind>(kind);
+        FormRow(contentWidth, e.fieldKind == FieldKind::Curl ? "Strength (px/s^2, - = clockwise)" : "Strength (px/s^2)");
+        ImGui::InputFloat("##Field strength", &e.strength);
+        ImGui::Checkbox("Fade to zero at the edge", &e.fade);
+    } else {
+        FormRow(contentWidth, once ? "Velocity kick X (px/s)" : "Accel X (px/s^2)");
+        ImGui::InputFloat("##Event X", &e.accel.x);
+        FormRow(contentWidth, once ? "Velocity kick Y (px/s)" : "Accel Y (px/s^2)");
+        ImGui::InputFloat("##Event Y", &e.accel.y);
+    }
     FormRow(contentWidth, "Start time (s)");
     ImGui::InputFloat("##Start time (s)", &e.startTime);
     e.startTime = std::max(e.startTime, 0.f);
@@ -623,42 +683,22 @@ static void DrawEventFields(SceneEvent& e, float contentWidth) {
     }
 }
 
-// Editable list of events. `live` edits ActiveScene.events mid-run (adds a "Fire now" button and
-// keeps eventFired in step); otherwise it edits a menu scene's list before a run starts.
-static void DrawEventsEditor(std::vector<SceneEvent>& events, float contentWidth, bool live) {
-    int removeIdx = -1;
-    for (size_t i = 0; i < events.size(); i++) {
-        ImGui::PushID(static_cast<int>(i));
-        SceneEvent& e = events[i];
-        char header[64];
-        std::snprintf(header, sizeof(header), "Event %d: %s, %s###hdr", static_cast<int>(i) + 1,
-                      EventShapeNames[static_cast<int>(e.shape)], e.mode == EventMode::Once ? "once" : "continuous");
-        if (ImGui::CollapsingHeader(header)) {
-            DrawEventFields(e, contentWidth);
-            if (live && ImGui::Button("Fire now")) {
-                e.startTime = static_cast<float>(simTime);
-                if (i < eventFired.size()) eventFired[i] = 0;
-            }
-            if (live) ImGui::SameLine();
-            if (ImGui::Button("Delete")) removeIdx = static_cast<int>(i);
-        }
-        ImGui::PopID();
-    }
-    if (removeIdx >= 0) {
-        events.erase(events.begin() + removeIdx);
-        if (live && static_cast<size_t>(removeIdx) < eventFired.size())
-            eventFired.erase(eventFired.begin() + removeIdx);
-    }
-    if (ImGui::Button("Add event", ImVec2(contentWidth, 0.f))) {
-        SceneEvent e;
-        if (live) e.startTime = static_cast<float>(simTime);
-        events.push_back(e);
-        if (live) eventFired.resize(events.size(), 0);
-    }
-}
+// The container's half-extents (for scenes sized from the window rather than in absolute pixels)
+// are measured once per run, in ResetSimulation, and held until the run ends -- so resizing the
+// window or the docked panels mid-run can't move the walls under the particles (which would crush
+// the fluid against a suddenly smaller box and blow the sim up). <= 0 = not frozen (menu).
+static float frozenHalfW = 0.f, frozenHalfH = 0.f;
 
-static void ResetSimulation() {
+// `fullWindow`: measure against the whole window (recordings and batch renders, which are drawn
+// full-frame) instead of the free area between the docked panels (a plain live run).
+static void ResetSimulation(bool fullWindow) {
     objects.clear();
+    {
+        const auto& b = ActiveScene.boundary;
+        const bool whole = fullWindow && !app.IsRecording();
+        frozenHalfW = (whole ? app.HalfWidth()  : app.RecordingHalfWidth())  * b.widthFrac;
+        frozenHalfH = (whole ? app.HalfHeight() : app.RecordingHalfHeight()) * b.heightFrac;
+    }
     Init();
     eventFired.assign(ActiveScene.events.size(), 0);
     runIndex++;
@@ -742,8 +782,8 @@ static void AdvanceQueue();
 // `run.batchRender` checkbox instead.
 static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch) {
     LoadScene(scene);
-    ResetSimulation();
     activeRun = run;
+    ResetSimulation(/*fullWindow=*/run.record || forceBatch || run.batchRender);
 
     // Shared by both outputs below, so a run's video and CSV carry the same run number and are
     // recognizable as belonging to the same run at a glance.
@@ -850,11 +890,12 @@ static void StartQueue() {
 // Resets the sim in place without leaving Running (and without touching any active recording or
 // data save) — distinct from ReturnToMenu, which is the "stop and reconfigure" path.
 static void RestartSimulation() {
-    ResetSimulation();
+    ResetSimulation(activeRun.record || activeRun.batchRender || queueRunningIndex >= 0);
 }
 
 static void ReturnToMenu() {
     queueRunningIndex = -1; // abort the rest of the queue, if any; runQueue itself stays intact
+    frozenHalfW = frozenHalfH = 0.f;
     app.StopRecording();
     dataRecorder.Stop();
     profileLogger.Stop();
@@ -875,6 +916,7 @@ static void AdvanceQueue() {
     queueRunningIndex++;
     if (queueRunningIndex >= static_cast<int>(runQueue.size())) {
         queueRunningIndex = -1;
+        frozenHalfW = frozenHalfH = 0.f;
         objects.clear();
         app.SetCaptureFromSwapchain(true);
         appState = AppState::Menu;
@@ -883,48 +925,49 @@ static void AdvanceQueue() {
     StartQueueEntry(runQueue[queueRunningIndex]);
 }
 
-static void DrawMenu() {
-    // Every free-text row below (TextDisabled/TextUnformatted, including this scene's own
-    // varying-length description) wraps at the same fixed width every stretchy input/button also
-    // uses — computed as whichever Checkbox label in this window is actually the widest, since a
-    // Checkbox can't wrap. Sizing everything else to match that (rather than a guessed constant,
-    // which was narrower than "Render as fast as possible (no live playback)") is what stops the
-    // width-260 rows from sitting stuck against the left edge with dead space to their right once
-    // that wider Checkbox forces the window itself wider.
-    auto CheckboxWidth = [](const char* label) {
-        return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(label).x;
-    };
-    const float MenuContentWidth = std::max({
-        // Floor wide enough that FormRow's right-hand column (~48%) still fits an InputFloat's
-        // value plus its +/- step buttons comfortably.
-        360.f,
-        CheckboxWidth("Record to video"),
-        CheckboxWidth("Render as fast as possible (no live playback)"),
-        CheckboxWidth("Circular spawn"),
-        CheckboxWidth("Save data to CSV"),
-        CheckboxWidth("Save channel velocity profile"),
-    });
-    // Labelled fields below all go through FormRow(MenuContentWidth, ...): label left, box right.
+// ================================================================================================
+// Docked-panel UI. One top bar, a left panel (Setup tabs / live view controls / render progress,
+// depending on appState), a right panel (events list + inspector) and the sim view in the free
+// center area, which also hosts the event gizmos (see ui/EventGizmo.h). All of it is drawn by
+// DrawUi(), the single UI callback.
+// ================================================================================================
 
-    // Fixed height (not ImGuiWindowFlags_AlwaysAutoResize) so the many CollapsingHeader sections
-    // and conditional rows below — expanding/collapsing a header, toggling gravity or a record/
-    // save-data checkbox, growing the run queue — don't visibly resize the window on every such
-    // change; content taller than this scrolls instead (ImGui adds a scrollbar automatically once
-    // content overflows a non-auto-resize window). Width still auto-fits MenuContentWidth each
-    // frame (SetNextWindowSize's 0-axis convention), which in practice never changes frame to
-    // frame since it's derived from fixed label/style metrics, not from what's expanded.
-    const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(0.f, io.DisplaySize.y * 0.85f), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.9f);
-    ImGui::Begin("Stjarna", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + MenuContentWidth);
+// Index into UiEvents() of the event the right panel inspects and the gizmo highlights.
+static int selectedEvent = -1;
 
-    ImGui::TextUnformatted("SPH Fluid Simulation");
-    ImGui::Separator();
+// The event list the panels/gizmo edit: the menu's scene before a run, the live scene during one
+// (so live edits take effect immediately and never touch the menu's copy).
+static std::vector<SceneEvent>& UiEvents() {
+    return appState == AppState::Menu ? menuConfig.scene.events : ActiveScene.events;
+}
 
-    ImGui::TextUnformatted("Scene");
-    ImGui::SetNextItemWidth(MenuContentWidth);
+// A tinted, rounded "card" grouping a few related rows. Widths inside should come from
+// GetContentRegionAvail() so they follow the panel's (user-resizable) width.
+static void BeginCard(const char* id) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, Theme::PanelAlt);
+    ImGui::BeginChild(id, ImVec2(0.f, 0.f),
+        ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+}
+static void EndCard() {
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+// ---- Setup tabs (Menu state) ----------------------------------------------------------------
+
+// Which scene index menuConfig.scene was last seeded from (-1 = never), so a scene change is told
+// apart from ordinary frames; also re-pointed by "Save Current as Preset" so saving doesn't reseed.
+static int lastSyncedSceneIndex = -1;
+
+static void DrawSceneTab() {
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImGui::PushTextWrapPos(0.f);
+
+    Widgets::Caption("SCENE");
+    {
+    BeginCard("##sceneCard");
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImGui::SetNextItemWidth(w);
     if (ImGui::BeginCombo("##scene", CombinedName(menuConfig.sceneIndex).c_str())) {
         for (int i = 0; i < CombinedCount(); i++) {
             const bool isSelected = (i == menuConfig.sceneIndex);
@@ -942,9 +985,9 @@ static void DrawMenu() {
     ImGui::TextUnformatted("Particles");
     int gridX = menuConfig.scene.spawn.gridCountX;
     int gridY = menuConfig.scene.spawn.gridCountY;
-    FormRow(MenuContentWidth, "Grid X");
+    FormRow(w, "Grid X");
     const bool gridXEdited = ImGui::InputInt("##Grid X", &gridX);
-    FormRow(MenuContentWidth, "Grid Y");
+    FormRow(w, "Grid Y");
     const bool gridYEdited = ImGui::InputInt("##Grid Y", &gridY);
     gridX = std::max(gridX, 1);
     gridY = std::max(gridY, 1);
@@ -954,7 +997,6 @@ static void DrawMenu() {
     // DrawMenu call, since lastSyncedSceneIndex starts at a value no real sceneIndex can equal.
     // Every other field is left exactly as the user last edited it on every other frame; see the
     // CollapsingHeader sections below.
-    static int lastSyncedSceneIndex = -1;
     if (menuConfig.sceneIndex != lastSyncedSceneIndex) {
         bool loadedOk = true;
         if (CombinedIsBuiltin(menuConfig.sceneIndex)) {
@@ -1009,24 +1051,19 @@ static void DrawMenu() {
     ImGui::TextDisabled("Real-Time Limit: %d particles",
                          menuConfig.scene.realTimeLimitX * menuConfig.scene.realTimeLimitY);
 
-    if (ImGui::CollapsingHeader("Spawn"))           DrawSpawnSection(menuConfig.scene.spawn, MenuContentWidth);
-    if (ImGui::CollapsingHeader("Boundary"))        DrawBoundarySection(menuConfig.scene.boundary, MenuContentWidth);
-    if (ImGui::CollapsingHeader("Physics"))         DrawPhysicsSection(menuConfig.scene.physics, MenuContentWidth);
-    if (ImGui::CollapsingHeader("Gravity"))         DrawGravitySection(menuConfig.scene.gravity, MenuContentWidth);
-    if (ImGui::CollapsingHeader("Particles / EOS")) DrawParticlesSection(menuConfig.scene.particles, MenuContentWidth);
-    if (ImGui::CollapsingHeader("Events"))          DrawEventsEditor(menuConfig.scene.events, MenuContentWidth, /*live=*/false);
 
-    // Always visible (not nested under "Record to video") so velocity/density gradient coloring
-    // can be set up before a run starts regardless of whether it's being recorded — previously
-    // only reachable by first checking "Record to video", or live via DrawRunningOverlay's corner
-    // panel once already running.
-    if (ImGui::CollapsingHeader("Color By")) DrawColorByControls(MenuContentWidth);
+    EndCard();
+    }
+
+    Widgets::Caption("LAYOUT");
+    if (ImGui::CollapsingHeader("Spawn"))    DrawSpawnSection(menuConfig.scene.spawn, w);
+    if (ImGui::CollapsingHeader("Boundary")) DrawBoundarySection(menuConfig.scene.boundary, w);
 
     if (ImGui::CollapsingHeader("Presets")) {
         static char presetSaveName[128] = "";
-        FormRow(MenuContentWidth, "Name");
+        FormRow(w, "Name");
         ImGui::InputText("##Name", presetSaveName, sizeof(presetSaveName));
-        if (ImGui::Button("Save Current as Preset", ImVec2(MenuContentWidth, 0.f)) && std::strlen(presetSaveName) > 0) {
+        if (ImGui::Button("Save Current as Preset", ImVec2(w, 0.f)) && std::strlen(presetSaveName) > 0) {
             const auto dir = ExecutableDir() / "presets";
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
@@ -1069,15 +1106,33 @@ static void DrawMenu() {
         ImGui::TextDisabled("Saved presets appear in the Scene list above.");
     }
 
-    ImGui::Separator();
+
+    ImGui::PopTextWrapPos();
+}
+
+static void DrawPhysicsTab() {
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImGui::PushTextWrapPos(0.f);
+    if (ImGui::CollapsingHeader("Physics", ImGuiTreeNodeFlags_DefaultOpen))         DrawPhysicsSection(menuConfig.scene.physics, w);
+    if (ImGui::CollapsingHeader("Gravity"))                                         DrawGravitySection(menuConfig.scene.gravity, w);
+    if (ImGui::CollapsingHeader("Particles / EOS", ImGuiTreeNodeFlags_DefaultOpen)) DrawParticlesSection(menuConfig.scene.particles, w);
+    // Always available (not tied to recording) so velocity/density gradient coloring can be set up
+    // before a run starts, including for batch renders that never visit the live view.
+    if (ImGui::CollapsingHeader("Color By"))                                        DrawColorByControls(w);
+    ImGui::PopTextWrapPos();
+}
+
+static void DrawOutputTab() {
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImGui::PushTextWrapPos(0.f);
     ImGui::Checkbox("Record to video", &menuConfig.run.record);
     if (menuConfig.run.record) {
-        FormRow(MenuContentWidth, "Title (optional label)");
+        FormRow(w, "Title (optional label)");
         ImGui::InputText("##Title (optional label)", menuConfig.run.title, sizeof(menuConfig.run.title));
-        FormRow(MenuContentWidth, "FPS");
+        FormRow(w, "FPS");
         ImGui::InputInt("##FPS", &menuConfig.run.fps);
         menuConfig.run.fps = std::clamp(menuConfig.run.fps, 1, 240);
-        FormRow(MenuContentWidth, "Length (s, 0 = unlimited)");
+        FormRow(w, "Length (s, 0 = unlimited)");
         ImGui::InputFloat("##Length (s, 0 = unlimited)", &menuConfig.run.lengthSeconds, 1.0f, 10.0f, "%.0f");
         menuConfig.run.lengthSeconds = std::max(menuConfig.run.lengthSeconds, 0.f);
         ImGui::TextDisabled("Saved to recordings/<generated name>.mp4 (requires ffmpeg on PATH)");
@@ -1092,12 +1147,12 @@ static void DrawMenu() {
     ImGui::Separator();
     ImGui::Checkbox("Save data to CSV", &menuConfig.run.saveData);
     if (menuConfig.run.saveData) {
-        FormRow(MenuContentWidth, "Data title (optional label)");
+        FormRow(w, "Data title (optional label)");
         ImGui::InputText("##Data title (optional label)", menuConfig.run.dataTitle, sizeof(menuConfig.run.dataTitle));
-        FormRow(MenuContentWidth, "Sample rate (Hz)");
+        FormRow(w, "Sample rate (Hz)");
         ImGui::InputInt("##Sample rate (Hz)", &menuConfig.run.dataRate);
         menuConfig.run.dataRate = std::clamp(menuConfig.run.dataRate, 1, 240);
-        FormRow(MenuContentWidth, "Save length (s, 0 = unlimited)");
+        FormRow(w, "Save length (s, 0 = unlimited)");
         ImGui::InputFloat("##Save length (s, 0 = unlimited)", &menuConfig.run.dataLengthSeconds, 1.0f, 10.0f, "%.0f");
         menuConfig.run.dataLengthSeconds = std::max(menuConfig.run.dataLengthSeconds, 0.f);
 
@@ -1117,24 +1172,30 @@ static void DrawMenu() {
     ImGui::Separator();
     ImGui::Checkbox("Save channel velocity profile", &menuConfig.run.saveProfile);
     if (menuConfig.run.saveProfile) {
-        FormRow(MenuContentWidth, "Profile title (optional label)");
+        FormRow(w, "Profile title (optional label)");
         ImGui::InputText("##Profile title (optional label)", menuConfig.run.profileTitle, sizeof(menuConfig.run.profileTitle));
-        FormRow(MenuContentWidth, "Profile rate (Hz, sim time)");
+        FormRow(w, "Profile rate (Hz, sim time)");
         ImGui::InputInt("##Profile rate (Hz, sim time)", &menuConfig.run.profileRate);
         menuConfig.run.profileRate = std::clamp(menuConfig.run.profileRate, 1, 60);
-        FormRow(MenuContentWidth, "Profile length (sim s, 0 = unlimited)");
+        FormRow(w, "Profile length (sim s, 0 = unlimited)");
         ImGui::InputFloat("##Profile length (sim s, 0 = unlimited)", &menuConfig.run.profileLengthSeconds, 1.0f, 10.0f, "%.0f");
         menuConfig.run.profileLengthSeconds = std::max(menuConfig.run.profileLengthSeconds, 0.f);
-        FormRow(MenuContentWidth, "Bins across channel (0 = one per row)");
+        FormRow(w, "Bins across channel (0 = one per row)");
         ImGui::InputInt("##Bins across channel (0 = one per row)", &menuConfig.run.profileBins);
         menuConfig.run.profileBins = std::max(menuConfig.run.profileBins, 0);
         ImGui::TextDisabled("Saved to data/<name>_profile.csv + _frames.csv: per-bin v_x across the "
                              "channel height, plus per-sample density/velocity stats.");
     }
 
-    ImGui::Separator();
+
+    ImGui::PopTextWrapPos();
+}
+
+static void DrawQueueTab() {
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImGui::PushTextWrapPos(0.f);
     ImGui::TextUnformatted("Run Queue");
-    if (ImGui::Button("Add to Queue", ImVec2(MenuContentWidth, 0.f))) {
+    if (ImGui::Button("Add to Queue", ImVec2(w, 0.f))) {
         if (HasDeterministicEnd(menuConfig.run))
             runQueue.push_back({ menuConfig.scene, menuConfig.run });
     }
@@ -1159,39 +1220,91 @@ static void DrawMenu() {
     if (removeIndex >= 0) runQueue.erase(runQueue.begin() + removeIndex);
 
     ImGui::BeginDisabled(runQueue.empty());
-    if (ImGui::Button("Run Queue", ImVec2(MenuContentWidth, 0.f))) StartQueue();
+    if (ImGui::Button("Run Queue", ImVec2(w, 0.f))) StartQueue();
     ImGui::EndDisabled();
 
-    ImGui::Separator();
-    if (ImGui::Button("Start Simulation", ImVec2(MenuContentWidth, 0.f)))
-        StartSimulationFromMenu();
 
     ImGui::PopTextWrapPos();
-    ImGui::End();
 }
 
-// Safe to draw now that VulkanContext::RenderFrame captures the video frame in a first pass and
-// only draws ImGui in a second one on top — this overlay lands in that second pass, so unlike
-// before it never reaches the recorded video no matter how long it stays on screen.
-static void DrawRenderingOverlay() {
-    const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowBgAlpha(0.9f);
-    ImGui::Begin("Rendering", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+static void DrawSetupPanel() {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    // Sticky footer: the tab content above scrolls, the particle readout and Start button never do.
+    const float buttonH = ImGui::GetFrameHeight() * 1.5f;
+    const float footerH = buttonH + ImGui::GetTextLineHeight() + style.ItemSpacing.y * 3.f;
 
-    ImGui::TextUnformatted(ActiveScene.name.c_str());
+    if (ImGui::BeginTabBar("##setupTabs")) {
+        struct Tab { const char* name; void (*draw)(); };
+        const Tab tabs[] = { { "Scene", DrawSceneTab }, { "Physics", DrawPhysicsTab },
+                             { "Output", DrawOutputTab }, { "Queue", DrawQueueTab } };
+        for (const Tab& t : tabs) {
+            if (!ImGui::BeginTabItem(t.name)) continue;
+            ImGui::BeginChild("##tabScroll", ImVec2(0.f, -footerH));
+            ImGui::Spacing();
+            t.draw();
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    ImGui::Separator();
+    const int count = menuConfig.scene.spawn.gridCountX * menuConfig.scene.spawn.gridCountY;
+    ImGui::TextDisabled("%d particles  |  real-time limit %d", count,
+                         menuConfig.scene.realTimeLimitX * menuConfig.scene.realTimeLimitY);
+    if (Widgets::PrimaryButton("Start Simulation", ImVec2(-FLT_MIN, buttonH)))
+        StartSimulationFromMenu();
+}
+
+// ---- Live view controls (Running state) -----------------------------------------------------
+
+static void DrawLivePanel() {
+    ImGui::PushTextWrapPos(0.f);
+
+    Widgets::Caption("RUN");
+    BeginCard("##runCard");
+    ImGui::Text("Simulated time   %.2f s", simTime);
+    ImGui::Text("Particles        %d", static_cast<int>(objects.size()));
+    ImGui::TextDisabled("Space: pause  |  Right: step  |  Left: step x10");
+    EndCard();
+
+    Widgets::Caption("VIEW");
+    BeginCard("##viewCard");
+    ImGui::Checkbox("Show event areas", &showEventAreas);
+    if (ActiveScene.boundary.periodicX) {
+        ImGui::Checkbox("Follow flow (camera)", &cameraFollow);
+        ImGui::TextDisabled("Cancels bulk drift so the profile's relative motion reads as motion.");
+    }
+    EndCard();
+
+    Widgets::Caption("COLOR BY");
+    BeginCard("##colorCard");
+    DrawColorByControls(ImGui::GetContentRegionAvail().x);
+    EndCard();
+
+    ImGui::PopTextWrapPos();
+}
+
+// ---- Render progress (Rendering state) ------------------------------------------------------
+
+// Safe to draw now that VulkanContext::RenderFrame captures the video frame in a first pass and
+// only draws ImGui in a second one on top — this never reaches the recorded video.
+static void DrawRenderingPanel() {
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImGui::PushTextWrapPos(0.f);
+
     if (queueRunningIndex >= 0)
         ImGui::Text("Queue: %d / %d", queueRunningIndex + 1, static_cast<int>(runQueue.size()));
+    ImGui::TextUnformatted(ActiveScene.name.c_str());
+    ImGui::Spacing();
 
     // A data-only queue entry (no video) never sets app.IsRecording() — track its own elapsed
-    // time via the data-save sample count instead, same source DrawRunningOverlay's "DATA %.1fs"
-    // indicator uses, so this progress display has something meaningful to show either way.
+    // time via the data-save sample count instead, same source the "DATA" chip uses.
     if (app.IsRecording()) {
         const float recorded = app.RecordedSeconds();
         if (activeRun.lengthSeconds > 0.f) {
             ImGui::Text("%.1f / %.1f seconds rendered", recorded, activeRun.lengthSeconds);
-            const float frac = std::clamp(recorded / activeRun.lengthSeconds, 0.f, 1.f);
-            ImGui::ProgressBar(frac, ImVec2(260.f, 0.f));
+            ImGui::ProgressBar(std::clamp(recorded / activeRun.lengthSeconds, 0.f, 1.f), ImVec2(w, 0.f));
         } else {
             ImGui::Text("%.1f seconds rendered (unlimited length)", recorded);
         }
@@ -1199,8 +1312,7 @@ static void DrawRenderingOverlay() {
         const float dataSeconds = dataRateActive > 0 ? static_cast<float>(dataSavedFrames) / dataRateActive : 0.f;
         if (activeRun.dataLengthSeconds > 0.f) {
             ImGui::Text("%.1f / %.1f seconds sampled", dataSeconds, activeRun.dataLengthSeconds);
-            const float frac = std::clamp(dataSeconds / activeRun.dataLengthSeconds, 0.f, 1.f);
-            ImGui::ProgressBar(frac, ImVec2(260.f, 0.f));
+            ImGui::ProgressBar(std::clamp(dataSeconds / activeRun.dataLengthSeconds, 0.f, 1.f), ImVec2(w, 0.f));
         } else {
             ImGui::Text("%.1f seconds sampled (unlimited length)", dataSeconds);
         }
@@ -1208,104 +1320,521 @@ static void DrawRenderingOverlay() {
         const float t = static_cast<float>(simTime);
         if (activeRun.profileLengthSeconds > 0.f) {
             ImGui::Text("%.1f / %.1f sim seconds profiled", t, activeRun.profileLengthSeconds);
-            ImGui::ProgressBar(std::clamp(t / activeRun.profileLengthSeconds, 0.f, 1.f), ImVec2(260.f, 0.f));
+            ImGui::ProgressBar(std::clamp(t / activeRun.profileLengthSeconds, 0.f, 1.f), ImVec2(w, 0.f));
         } else {
             ImGui::Text("%.1f sim seconds profiled (unlimited length)", t);
         }
     }
-    ImGui::TextDisabled("Rendering as fast as possible, straight to video —\nno live playback follows.");
+    ImGui::Spacing();
+    ImGui::TextDisabled("Rendering as fast as possible, straight to video - no live playback follows.");
+    ImGui::Spacing();
+    if (Widgets::DangerButton("Cancel", ImVec2(w, 0.f))) ReturnToMenu();
 
-    if (ImGui::Button("Cancel", ImVec2(260.f, 0.f))) ReturnToMenu();
+    ImGui::PopTextWrapPos();
+}
 
+static void DrawLeftPanel() {
+    const char* title = appState == AppState::Menu    ? "Setup###LeftPanel"
+                      : appState == AppState::Running ? "Simulation###LeftPanel"
+                                                      : "Rendering###LeftPanel";
+    if (ImGui::Begin(title)) {
+        switch (appState) {
+            case AppState::Menu:      DrawSetupPanel();     break;
+            case AppState::Running:   DrawLivePanel();      break;
+            case AppState::Rendering: DrawRenderingPanel(); break;
+        }
+    }
     ImGui::End();
 }
 
-static void DrawRunningOverlay() {
-    const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10.f, 10.f), ImGuiCond_Always, ImVec2(1.f, 0.f));
-    ImGui::SetNextWindowBgAlpha(0.85f);
-    ImGui::Begin("Controls", nullptr,
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+// ---- Events panel (right) -------------------------------------------------------------------
 
-    // Fixed content width (rather than whatever the widest row happens to auto-size to) so the
-    // panel doesn't visibly resize when the color-by rows appear/disappear, and so the row-content
-    // computations below (button/combo alignment) have a stable width to work from.
-    constexpr float ContentWidth = 240.f;
-
-    ImGui::TextUnformatted(ActiveScene.name.c_str());
-    if (app.IsRecording()) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "REC %.1fs", app.RecordedSeconds());
+// Shape/mode/push/duration used for areas created by dragging in the sim view or "+ New event".
+static void DrawEventDefaults(float w) {
+    int shape = static_cast<int>(placeEventTemplate.shape), mode = static_cast<int>(placeEventTemplate.mode);
+    FormRow(w, "Shape");
+    if (ImGui::Combo("##defShape", &shape, EventShapeNames, 2)) placeEventTemplate.shape = static_cast<EventShape>(shape);
+    FormRow(w, "Mode");
+    if (ImGui::Combo("##defMode", &mode, EventModeNames, 3)) placeEventTemplate.mode = static_cast<EventMode>(mode);
+    const bool once = placeEventTemplate.mode == EventMode::Once;
+    if (placeEventTemplate.mode == EventMode::Field) {
+        int kind = static_cast<int>(placeEventTemplate.fieldKind);
+        FormRow(w, "Field");
+        if (ImGui::Combo("##defFieldKind", &kind, FieldKindNames, 3)) placeEventTemplate.fieldKind = static_cast<FieldKind>(kind);
+        FormRow(w, "Strength (px/s^2)");
+        ImGui::InputFloat("##defStrength", &placeEventTemplate.strength);
+        ImGui::Checkbox("Fade to zero at the edge##def", &placeEventTemplate.fade);
+    } else {
+        FormRow(w, once ? "Kick X (px/s)" : "Accel X (px/s^2)");
+        ImGui::InputFloat("##defX", &placeEventTemplate.accel.x);
+        FormRow(w, once ? "Kick Y (px/s)" : "Accel Y (px/s^2)");
+        ImGui::InputFloat("##defY", &placeEventTemplate.accel.y);
     }
-    if (dataRecorder.IsActive()) {
-        ImGui::SameLine();
-        const float dataSeconds = dataRateActive > 0 ? static_cast<float>(dataSavedFrames) / dataRateActive : 0.f;
-        ImGui::TextColored(ImVec4(0.3f, 0.6f, 1.0f, 1.0f), "DATA %.1fs", dataSeconds);
+    if (!once) {
+        FormRow(w, "Duration (s, 0 = unlimited)");
+        ImGui::InputFloat("##defDur", &placeEventTemplate.duration);
+        placeEventTemplate.duration = std::max(placeEventTemplate.duration, 0.f);
     }
-    if (profileLogger.IsActive()) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.5f, 1.0f), "PROFILE %.1fs", static_cast<float>(simTime));
+}
+
+static void RemoveEventAt(std::vector<SceneEvent>& events, int index) {
+    if (index < 0 || index >= static_cast<int>(events.size())) return;
+    events.erase(events.begin() + index);
+    if (appState != AppState::Menu && index < static_cast<int>(eventFired.size()))
+        eventFired.erase(eventFired.begin() + index);
+    selectedEvent = -1;
+}
+
+// Result of the async "Browse..." dialog; SDL may call back from another thread, so hand it over
+// through a mutex and let the UI pick it up next frame.
+static std::mutex  pickedImageMutex;
+static std::string pickedImagePath;
+
+static void SDLCALL OnImagePicked(void*, const char* const* files, int) {
+    if (files && files[0]) {
+        std::lock_guard<std::mutex> lock(pickedImageMutex);
+        pickedImagePath = files[0];
     }
-    if (paused) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "PAUSED");
-    }
+}
 
-    ImGui::Spacing();
-    const float buttonWidth = (ContentWidth - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-    if (ImGui::Button("Restart", ImVec2(buttonWidth, 0.f))) RestartSimulation();
-    ImGui::SameLine();
-    if (ImGui::Button("Menu", ImVec2(buttonWidth, 0.f))) ReturnToMenu();
-
-    ImGui::Spacing();
-    if (ImGui::Button(paused ? "Resume" : "Pause", ImVec2(buttonWidth, 0.f))) TogglePause();
-    ImGui::SameLine();
-    if (ImGui::Button("Step", ImVec2(buttonWidth, 0.f))) StepOnce();
-    if (ImGui::Button("Step x10", ImVec2(ContentWidth, 0.f))) StepBig();
-    ImGui::TextDisabled("Space to pause, arrows to step");
-
-    if (ActiveScene.boundary.periodicX) {
-        ImGui::Spacing();
-        ImGui::Checkbox("Follow flow (camera)", &cameraFollow);
-        ImGui::TextDisabled("Cancels bulk drift so the profile's relative\nmotion reads as motion instead of scrolling past");
-    }
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    DrawColorByControls(ContentWidth);
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-    ImGui::Checkbox("Show event areas", &showEventAreas);
-    if (ImGui::CollapsingHeader("Events")) {
-        DrawEventsEditor(ActiveScene.events, ContentWidth, /*live=*/true);
-        ImGui::Spacing();
-        ImGui::Checkbox("Place by click", &placeEventArmed);
-        if (placeEventArmed) {
-            ImGui::TextDisabled("Click in the sim to create an event there,\nusing the settings below (starts now).");
-            DrawEventFields(placeEventTemplate, ContentWidth);
+static void DrawColorPatternSection(SceneColorPattern& p, float w) {
+    {
+        std::lock_guard<std::mutex> lock(pickedImageMutex);
+        if (!pickedImagePath.empty()) {
+            p.imagePath = pickedImagePath;
+            p.kind      = ColorPatternKind::Image;
+            pickedImagePath.clear();
         }
     }
 
-    ImGui::End();
+    static const char* KindNames[] = { "None", "Vertical stripes", "Horizontal stripes", "Checkerboard",
+                                       "Rings", "Gradient (left to right)", "Image" };
+    int kind = static_cast<int>(p.kind);
+    FormRow(w, "Pattern");
+    if (ImGui::Combo("##patternKind", &kind, KindNames, IM_ARRAYSIZE(KindNames)))
+        p.kind = static_cast<ColorPatternKind>(kind);
+    if (p.kind == ColorPatternKind::None) return;
 
-    // After End() so WantCaptureMouse reflects this frame's panels: a click on the overlay itself
-    // must not also drop an event underneath it.
-    if (placeEventArmed && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.WantCaptureMouse) {
-        // Window center is the world origin, +y up, 1 world unit = 1 framebuffer pixel (see
-        // circle.vert); the camera-follow shift is display-only, so add it back for follow scenes.
-        const bool followCam = ActiveScene.boundary.periodicX && cameraFollow;
-        SceneEvent e = placeEventTemplate;
-        e.cx = (io.MousePos.x - io.DisplaySize.x * 0.5f) * io.DisplayFramebufferScale.x + (followCam ? cameraOffsetX : 0.f);
-        e.cy = -(io.MousePos.y - io.DisplaySize.y * 0.5f) * io.DisplayFramebufferScale.y;
-        e.startTime = static_cast<float>(simTime);
-        ActiveScene.events.push_back(e);
-        eventFired.resize(ActiveScene.events.size(), 0);
+    const float swatchSize = ImGui::GetFrameHeight();
+    if (p.kind != ColorPatternKind::Image) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Color A");
+        ImGui::SameLine(w - swatchSize);
+        ImGui::ColorEdit4("##patternA", &p.colorA.r, ImGuiColorEditFlags_NoInputs);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Color B");
+        ImGui::SameLine(w - swatchSize);
+        ImGui::ColorEdit4("##patternB", &p.colorB.r, ImGuiColorEditFlags_NoInputs);
     }
+    if (p.kind != ColorPatternKind::Gradient && p.kind != ColorPatternKind::Image) {
+        FormRow(w, "Cell size (px)");
+        ImGui::InputFloat("##patternCell", &p.cellSize);
+        p.cellSize = std::max(p.cellSize, 4.f);
+    } else if (p.kind == ColorPatternKind::Image) {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf), "%s", p.imagePath.c_str());
+        FormRow(w, "Image file");
+        if (ImGui::InputText("##patternImage", buf, sizeof(buf))) p.imagePath = buf;
+        if (ImGui::Button("Browse...")) {
+            static const SDL_DialogFileFilter filters[] = { { "Images (PNG, BMP)", "png;bmp" } };
+            SDL_ShowOpenFileDialog(OnImagePicked, nullptr, nullptr, filters, 1, nullptr, false);
+        }
+        ImGui::TextDisabled("%s", PatternImageStatus(p).c_str());
+    }
+}
+
+// Setup-only counterpart of the events list: persistent-color areas (see SceneColorRegion).
+static void DrawColorRegionsPanel() {
+    {
+        const float pw = ImGui::GetContentRegionAvail().x;
+        Widgets::Caption("PATTERN");
+        DrawColorPatternSection(menuConfig.scene.colorPattern, pw);
+        ImGui::Spacing();
+        Widgets::Caption("AREAS");
+    }
+    auto& regions = menuConfig.scene.colorRegions;
+    if (selectedRegion >= static_cast<int>(regions.size())) selectedRegion = -1;
+    const float w = ImGui::GetContentRegionAvail().x;
+
+    ImGui::TextDisabled("Drag in the view to draw an area. Drag an area to move it, its handles to\n"
+                         "resize it (hold Alt to resize from the center). Del removes the selected\n"
+                         "area. Particles spawned inside keep its color for the whole run.");
+    ImGui::Spacing();
+
+    if (Widgets::PrimaryButton("+ New area at center", ImVec2(w, 0.f))) {
+        SceneColorRegion r = placeRegionTemplate;
+        r.cx = 0.f; r.cy = 0.f;
+        regions.push_back(r);
+        selectedRegion = static_cast<int>(regions.size()) - 1;
+    }
+
+    if (ImGui::CollapsingHeader("New area defaults")) {
+        static const char* ShapeNames[] = { "Circle", "Rect" };
+        int shape = static_cast<int>(placeRegionTemplate.shape);
+        FormRow(w, "Shape");
+        if (ImGui::Combo("##defRegionShape", &shape, ShapeNames, 2)) placeRegionTemplate.shape = static_cast<EventShape>(shape);
+        const float swatchSize = ImGui::GetFrameHeight();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Color");
+        ImGui::SameLine(w - swatchSize);
+        ImGui::ColorEdit4("##defRegionColor", &placeRegionTemplate.color.r, ImGuiColorEditFlags_NoInputs);
+    }
+
+    Widgets::Caption("PERSISTENT COLOR");
+    if (regions.empty()) ImGui::TextDisabled("None yet.");
+    for (int i = 0; i < static_cast<int>(regions.size()); i++) {
+        const SceneColorRegion& r = regions[i];
+        ImGui::PushID(i);
+        char label[96];
+        std::snprintf(label, sizeof(label), "      %d   %s", i + 1, r.shape == EventShape::Circle ? "Circle" : "Rect");
+        const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+        if (ImGui::Selectable(label, i == selectedRegion)) selectedRegion = i;
+        ImGui::GetWindowDrawList()->AddCircleFilled(
+            ImVec2(rowPos.x + ImGui::GetFontSize() * 0.7f, rowPos.y + ImGui::GetFrameHeight() * 0.5f - 2.f),
+            ImGui::GetFontSize() * 0.28f, ImGui::ColorConvertFloat4ToU32(ImVec4(r.color.r, r.color.g, r.color.b, 1.f)));
+        ImGui::PopID();
+    }
+
+    if (selectedRegion >= 0) {
+        SceneColorRegion& r = regions[selectedRegion];
+        char title[32];
+        std::snprintf(title, sizeof(title), "AREA %d", selectedRegion + 1);
+        Widgets::Caption(title);
+        BeginCard("##regionInspector");
+        DrawColorRegionFields(r, ImGui::GetContentRegionAvail().x);
+        ImGui::Spacing();
+        const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.f;
+        if (ImGui::Button("Duplicate", ImVec2(bw, 0.f))) {
+            SceneColorRegion copy = r;
+            copy.cx += 30.f; copy.cy -= 30.f;
+            regions.push_back(copy);
+            selectedRegion = static_cast<int>(regions.size()) - 1;
+        } else {
+            ImGui::SameLine();
+            if (Widgets::DangerButton("Delete", ImVec2(bw, 0.f))) {
+                regions.erase(regions.begin() + selectedRegion);
+                selectedRegion = -1;
+            }
+        }
+        EndCard();
+    }
+}
+
+// Own window, docked as a tab beside "Events" (first appearance only; afterwards the user's layout wins).
+static void DrawColorsWindow() {
+    colorsTabActive = false;
+    if (appState != AppState::Menu) return;
+    if (const ImGuiWindow* rw = ImGui::FindWindowByName(Workspace::RightPanelId); rw && rw->DockId)
+        ImGui::SetNextWindowDockID(rw->DockId, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Persistent Color###ColorsPanel")) {
+        colorsTabActive = true;
+        ImGui::PushTextWrapPos(0.f);
+        DrawColorRegionsPanel();
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::End();
+}
+
+static void DrawEventsPanel() {
+    if (ImGui::Begin("Events###RightPanel")) {
+        const bool locked = appState == AppState::Rendering;
+        const bool live   = appState != AppState::Menu;
+        ImGui::BeginDisabled(locked);
+        ImGui::PushTextWrapPos(0.f);
+
+        auto& events = UiEvents();
+        if (selectedEvent >= static_cast<int>(events.size())) selectedEvent = -1;
+        const float w = ImGui::GetContentRegionAvail().x;
+
+        ImGui::TextDisabled("Drag in the view to draw an area. Drag an area to move it, its handles to\n"
+                             "resize it (each side/corner; hold Alt to resize from the center) or\n"
+                             "aim the push. Del removes the selected event.");
+        ImGui::Spacing();
+
+        if (Widgets::PrimaryButton("+ New event at center", ImVec2(w, 0.f))) {
+            SceneEvent e = placeEventTemplate;
+            e.cx = 0.f; e.cy = 0.f;
+            if (live) e.startTime = static_cast<float>(simTime);
+            events.push_back(e);
+            if (live) eventFired.resize(events.size(), 0);
+            selectedEvent = static_cast<int>(events.size()) - 1;
+        }
+
+        if (ImGui::CollapsingHeader("New event defaults")) DrawEventDefaults(w);
+
+        Widgets::Caption("EVENTS");
+        if (events.empty()) ImGui::TextDisabled("None yet.");
+        for (int i = 0; i < static_cast<int>(events.size()); i++) {
+            const SceneEvent& e = events[i];
+            ImGui::PushID(i);
+            char label[96];
+            std::snprintf(label, sizeof(label), "      %d   %s | %s", i + 1,
+                          e.shape == EventShape::Circle ? "Circle" : "Rect",
+                          e.mode == EventMode::Once ? "one-shot kick" : e.mode == EventMode::Field ? "vector field" : "continuous push");
+            const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+            if (ImGui::Selectable(label, i == selectedEvent)) selectedEvent = i;
+            const ImVec4 col = e.mode == EventMode::Once ? Theme::Amber : e.mode == EventMode::Field ? Theme::Teal : Theme::Violet;
+            ImGui::GetWindowDrawList()->AddCircleFilled(
+                ImVec2(rowPos.x + ImGui::GetFontSize() * 0.7f, rowPos.y + ImGui::GetFrameHeight() * 0.5f - 2.f),
+                ImGui::GetFontSize() * 0.28f, Theme::U32(col));
+            ImGui::PopID();
+        }
+
+        if (selectedEvent >= 0) {
+            SceneEvent& e = events[selectedEvent];
+            char title[32];
+            std::snprintf(title, sizeof(title), "EVENT %d", selectedEvent + 1);
+            Widgets::Caption(title);
+            BeginCard("##eventInspector");
+            DrawEventFields(e, ImGui::GetContentRegionAvail().x);
+            ImGui::Spacing();
+            const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.f) / 3.f;
+            ImGui::BeginDisabled(!live);
+            if (ImGui::Button("Fire now", ImVec2(bw, 0.f))) {
+                e.startTime = static_cast<float>(simTime);
+                if (selectedEvent < static_cast<int>(eventFired.size())) eventFired[selectedEvent] = 0;
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Duplicate", ImVec2(bw, 0.f))) {
+                SceneEvent copy = e;
+                copy.cx += 30.f; copy.cy -= 30.f;
+                events.push_back(copy);
+                if (live) eventFired.resize(events.size(), 0);
+                selectedEvent = static_cast<int>(events.size()) - 1;
+            } else {
+                ImGui::SameLine();
+                if (Widgets::DangerButton("Delete", ImVec2(bw, 0.f))) RemoveEventAt(events, selectedEvent);
+            }
+            EndCard();
+        }
+
+        ImGui::PopTextWrapPos();
+        ImGui::EndDisabled();
+    }
+    ImGui::End();
+}
+
+// ---- Sim view: scene preview (setup) + event gizmos -----------------------------------------
+
+static void DrawSimOverlay(const Workspace::Frame& frame) {
+    const ImGuiIO& io = ImGui::GetIO();
+    const float fb = std::max(io.DisplayFramebufferScale.x, 0.01f); // framebuffer pixels per ImGui point
+
+    // The sim is rendered into the free center area (see VulkanContext::SetSceneViewport); the
+    // renderer ignores this while a recording is active and reports the window center instead.
+    app.SetSceneViewport(frame.centerMin.x * fb, frame.centerMin.y * fb,
+                         (frame.centerMax.x - frame.centerMin.x) * fb,
+                         (frame.centerMax.y - frame.centerMin.y) * fb);
+    float cxPx = 0.f, cyPx = 0.f;
+    app.SceneCenterPx(cxPx, cyPx);
+
+    EventGizmo::View view;
+    view.origin  = ImVec2(cxPx / fb, cyPx / fb);
+    view.scale   = 1.f / fb;
+    view.clipMin = frame.centerMin;
+    view.clipMax = frame.centerMax;
+
+    if (appState == AppState::Menu) {
+        // Pre-run preview: the container and the spawn block, so events can be placed visually.
+        const Scene& s = menuConfig.scene;
+        const float halfW = s.boundary.halfWidthPx  > 0.f ? s.boundary.halfWidthPx  : app.RecordingHalfWidth()  * s.boundary.widthFrac;
+        const float halfH = s.boundary.halfHeightPx > 0.f ? s.boundary.halfHeightPx : app.RecordingHalfHeight() * s.boundary.heightFrac;
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        dl->PushClipRect(frame.centerMin, frame.centerMax, true);
+        const ImVec2 a(view.origin.x - halfW * view.scale, view.origin.y - halfH * view.scale);
+        const ImVec2 b(view.origin.x + halfW * view.scale, view.origin.y + halfH * view.scale);
+        dl->AddRectFilled(a, b, Theme::U32(Theme::WithAlpha(Theme::Panel, 0.45f)), 14.f);
+        dl->AddRect(a, b, Theme::U32(Theme::WithAlpha(Theme::TextDim, 0.8f)), 14.f, 0, 3.f);
+
+        const float spacing = s.particles.circleRadius * 3.f * s.spawn.spacingScale;
+        const float cx = s.spawn.offsetXFrac * halfW;
+        const ImU32 fill = Theme::U32(Theme::WithAlpha(Theme::Accent, 0.22f));
+        const ImU32 line = Theme::U32(Theme::WithAlpha(Theme::Accent, 0.7f));
+        if (s.spawn.circular) {
+            const float r = spacing * std::sqrt(static_cast<float>(s.spawn.gridCountX * s.spawn.gridCountY) / 3.14159265f);
+            const ImVec2 c(view.origin.x + cx * view.scale, view.origin.y);
+            dl->AddCircleFilled(c, r * view.scale, fill, 96);
+            dl->AddCircle(c, r * view.scale, line, 96, 2.f);
+        } else {
+            const float bw = s.spawn.gridCountX * spacing * 0.5f, bh = s.spawn.gridCountY * spacing * 0.5f;
+            const ImVec2 pa(view.origin.x + (cx - bw) * view.scale, view.origin.y - bh * view.scale);
+            const ImVec2 pb(view.origin.x + (cx + bw) * view.scale, view.origin.y + bh * view.scale);
+            dl->AddRectFilled(pa, pb, fill, 8.f);
+            dl->AddRect(pa, pb, line, 8.f, 0, 2.f);
+        }
+        if (s.colorPattern.kind != ColorPatternKind::None) {
+            // Coarse sample grid over the spawn block, so the pattern shows before the run starts.
+            const float bw = s.spawn.circular ? spacing * std::sqrt(static_cast<float>(s.spawn.gridCountX * s.spawn.gridCountY) / 3.14159265f)
+                                              : s.spawn.gridCountX * spacing * 0.5f;
+            const float bh = s.spawn.circular ? bw : s.spawn.gridCountY * spacing * 0.5f;
+            const PatternSampler sampler(s.colorPattern, cx - bw, -bh, cx + bw, bh);
+            const float step = std::max(std::max(bw, bh) / 70.f, 2.f);
+            for (float wy = -bh + step * 0.5f; wy < bh; wy += step)
+                for (float wx = cx - bw + step * 0.5f; wx < cx + bw; wx += step) {
+                    if (s.spawn.circular && std::hypot(wx - cx, wy) > bw) continue;
+                    Color pc;
+                    if (!sampler.Sample(wx, wy, pc)) continue;
+                    const ImVec2 q(view.origin.x + wx * view.scale, view.origin.y - wy * view.scale);
+                    const float hs = step * 0.5f * view.scale + 0.5f;
+                    dl->AddRectFilled(ImVec2(q.x - hs, q.y - hs), ImVec2(q.x + hs, q.y + hs),
+                                      ImGui::ColorConvertFloat4ToU32(ImVec4(pc.r, pc.g, pc.b, 0.85f)));
+                }
+        }
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%d particles", s.spawn.gridCountX * s.spawn.gridCountY);
+        dl->AddText(ImVec2(a.x + 14.f, a.y + 10.f), Theme::U32(Theme::TextDim), buf);
+        dl->PopClipRect();
+    }
+
+    if (appState == AppState::Menu || (appState == AppState::Running && showEventAreas)) {
+        if (appState == AppState::Running && ActiveScene.boundary.periodicX && cameraFollow) {
+            view.cameraOffsetX = cameraOffsetX;
+            view.wrapHalfWidth = ScreenHalfWidth();
+        }
+        // Setup only: persistent-color areas, edited through SceneEvent proxies so the same gizmo can
+        // draw/drag them. Only interactive while the "Persistent Color" tab is open (the events gizmo
+        // below is then draw-only), and always drawn so they stay visible.
+        const bool editColors = appState == AppState::Menu && colorsTabActive;
+        if (appState == AppState::Menu) {
+            auto& regions = menuConfig.scene.colorRegions;
+            std::vector<SceneEvent> proxy(regions.size());
+            std::vector<ImVec4>     tints(regions.size());
+            for (size_t i = 0; i < regions.size(); i++) {
+                const SceneColorRegion& rg = regions[i];
+                proxy[i].shape = rg.shape;
+                proxy[i].cx = rg.cx; proxy[i].cy = rg.cy;
+                proxy[i].radius = rg.radius; proxy[i].halfW = rg.halfW; proxy[i].halfH = rg.halfH;
+                tints[i] = ImVec4(rg.color.r, rg.color.g, rg.color.b, 1.f);
+            }
+            SceneEvent proxyDefaults;
+            proxyDefaults.shape = placeRegionTemplate.shape;
+            int dummySel = -1;
+            EventGizmo::Context rc;
+            rc.view        = view;
+            rc.events      = &proxy;
+            rc.selected    = editColors ? &selectedRegion : &dummySel;
+            rc.defaults    = &proxyDefaults;
+            rc.interactive = editColors;
+            rc.showArrows  = false;
+            rc.colors      = &tints;
+            const EventGizmo::Result rr = EventGizmo::Update(rc);
+            if (rr.deleted >= 0 && rr.deleted < static_cast<int>(regions.size()))
+                regions.erase(regions.begin() + rr.deleted);
+            for (size_t i = 0; i < regions.size() && i < proxy.size(); i++) {
+                regions[i].cx = proxy[i].cx; regions[i].cy = proxy[i].cy;
+                regions[i].radius = proxy[i].radius;
+                regions[i].halfW = proxy[i].halfW; regions[i].halfH = proxy[i].halfH;
+            }
+            if (rr.created && proxy.size() > regions.size()) {
+                const SceneEvent& p = proxy.back();
+                SceneColorRegion n = placeRegionTemplate;
+                n.shape = p.shape; n.cx = p.cx; n.cy = p.cy;
+                n.radius = p.radius; n.halfW = p.halfW; n.halfH = p.halfH;
+                regions.push_back(n);
+            }
+        }
+
+        EventGizmo::Context ctx;
+        ctx.view     = view;
+        ctx.events   = &UiEvents();
+        ctx.selected = &selectedEvent;
+        ctx.defaults = &placeEventTemplate;
+        ctx.fired    = &eventFired;
+        ctx.simTime  = simTime;
+        ctx.live     = appState == AppState::Running;
+        ctx.interactive = !editColors;
+        const EventGizmo::Result r = EventGizmo::Update(ctx);
+        if (ctx.live) {
+            eventFired.resize(ctx.events->size(), 0);
+            if (r.deleted >= 0 && r.deleted < static_cast<int>(eventFired.size()))
+                eventFired.erase(eventFired.begin() + r.deleted);
+        }
+    }
+}
+
+// ---- Top bar --------------------------------------------------------------------------------
+
+static void DrawTopBarContents() {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(Theme::Accent, "STJARNA");
+    ImGui::SameLine();
+
+    switch (appState) {
+        case AppState::Menu:      Widgets::Chip("SETUP", Theme::Accent); break;
+        case AppState::Running:   paused ? Widgets::Chip("PAUSED", Theme::Amber) : Widgets::Chip("RUNNING", Theme::Teal); break;
+        case AppState::Rendering: Widgets::Chip("RENDERING", Theme::Coral); break;
+    }
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("%s", (appState == AppState::Menu ? menuConfig.scene.name : ActiveScene.name).c_str());
+
+    char buf[48];
+    if (app.IsRecording()) {
+        std::snprintf(buf, sizeof(buf), "REC %.1fs", app.RecordedSeconds());
+        ImGui::SameLine(); Widgets::Chip(buf, Theme::Coral);
+    }
+    if (dataRecorder.IsActive()) {
+        const float dataSeconds = dataRateActive > 0 ? static_cast<float>(dataSavedFrames) / dataRateActive : 0.f;
+        std::snprintf(buf, sizeof(buf), "DATA %.1fs", dataSeconds);
+        ImGui::SameLine(); Widgets::Chip(buf, Theme::Accent);
+    }
+    if (profileLogger.IsActive()) {
+        std::snprintf(buf, sizeof(buf), "PROFILE %.1fs", static_cast<float>(simTime));
+        ImGui::SameLine(); Widgets::Chip(buf, Theme::Teal);
+    }
+
+    // Right-aligned action buttons.
+    struct Btn { const char* label; int id; };
+    std::vector<Btn> btns;
+    if (appState == AppState::Running) {
+        btns = { { paused ? "Resume" : "Pause", 0 }, { "Step", 1 }, { "Step x10", 2 }, { "Restart", 3 }, { "Menu", 4 } };
+    } else if (appState == AppState::Rendering) {
+        btns = { { "Cancel", 4 } };
+    }
+    btns.push_back({ "Reset layout", 5 });
+
+    float total = style.ItemSpacing.x * static_cast<float>(btns.size() - 1);
+    for (const Btn& b : btns) total += ImGui::CalcTextSize(b.label).x + style.FramePadding.x * 2.f;
+    ImGui::SameLine(ImGui::GetWindowWidth() - total - style.WindowPadding.x);
+
+    for (size_t i = 0; i < btns.size(); i++) {
+        if (i > 0) ImGui::SameLine();
+        if (ImGui::Button(btns[i].label)) {
+            switch (btns[i].id) {
+                case 0: TogglePause();       break;
+                case 1: StepOnce();          break;
+                case 2: StepBig();           break;
+                case 3: RestartSimulation(); break;
+                case 4: ReturnToMenu();      break;
+                case 5: Workspace::RequestLayoutReset(); break;
+            }
+        }
+    }
+}
+
+// The single UI callback (see main()): top bar, dockspace, the two panels, then the sim-view
+// overlay — in that order, so the gizmo's io.WantCaptureMouse check already knows about this
+// frame's panels.
+static void DrawUi() {
+    // A different run state or scene means the old selection no longer points at the same event.
+    static AppState lastState = AppState::Menu;
+    static int      lastScene = -2;
+    if (appState != lastState || menuConfig.sceneIndex != lastScene) {
+        selectedEvent = -1;
+        lastState = appState;
+        lastScene = menuConfig.sceneIndex;
+    }
+
+    if (Workspace::BeginTopBar()) DrawTopBarContents();
+    Workspace::EndTopBar();
+    const Workspace::Frame frame = Workspace::DockSpace();
+
+    DrawLeftPanel();
+    DrawEventsPanel();
+    DrawColorsWindow();
+    DrawSimOverlay(frame);
 }
 
 Object& CreateObject(float x, float y, Renderable r) {
@@ -1325,11 +1854,13 @@ void RemoveObject(size_t i) {
 // SceneBoundary::halfWidthPx/halfHeightPx gets that exact size instead, independent of both.
 float ScreenHalfWidth() {
     const auto& b = ActiveScene.boundary;
-    return b.halfWidthPx > 0.f ? b.halfWidthPx : app.RecordingHalfWidth() * b.widthFrac;
+    if (b.halfWidthPx > 0.f) return b.halfWidthPx;
+    return frozenHalfW > 0.f ? frozenHalfW : app.RecordingHalfWidth() * b.widthFrac;
 }
 float ScreenHalfHeight() {
     const auto& b = ActiveScene.boundary;
-    return b.halfHeightPx > 0.f ? b.halfHeightPx : app.RecordingHalfHeight() * b.heightFrac;
+    if (b.halfHeightPx > 0.f) return b.halfHeightPx;
+    return frozenHalfH > 0.f ? frozenHalfH : app.RecordingHalfHeight() * b.heightFrac;
 }
 
 // Draws a black frame at the active scene's boundary, so a container narrower than the window
@@ -1375,26 +1906,6 @@ static float WrapX(float x, float hw) {
     x = std::fmod(x + hw, span);
     if (x < 0.f) x += span;
     return x - hw;
-}
-
-// Live-view-only preview of each event's area (never drawn while recording, so it can't end up in
-// a video): translucent fill for circles, an outline for rects. Brighter once an event has
-// fired/is active, so it's visible when something is actually happening.
-static void DrawEventAreas(App& app) {
-    const float hw = ScreenHalfWidth();
-    const bool  followCam = ActiveScene.boundary.periodicX && cameraFollow;
-    const auto& events = ActiveScene.events;
-    for (size_t i = 0; i < events.size(); i++) {
-        const SceneEvent& e = events[i];
-        const bool active = e.mode == EventMode::Once
-            ? (i < eventFired.size() && eventFired[i])
-            : (simTime >= e.startTime && (e.duration <= 0.f || simTime < static_cast<double>(e.startTime) + e.duration));
-        const float a = active ? 0.45f : 0.18f;
-        const Color c = e.mode == EventMode::Once ? Color{ 1.0f, 0.55f, 0.1f, a } : Color{ 0.9f, 0.2f, 0.9f, a };
-        const float x = followCam ? WrapX(e.cx - cameraOffsetX, hw) : e.cx;
-        if (e.shape == EventShape::Circle) app.AddCircle(x, e.cy, e.radius, c);
-        else app.AddRectOutline(x, e.cy, e.halfW, e.halfH, 3.0f, { c.r, c.g, c.b, std::max(a, 0.5f) });
-    }
 }
 
 // Integrates a single substep, reusing whatever force (particle.acc) the last Update() call
@@ -1477,8 +1988,6 @@ static void DrawAndSubmitFrame(float dt, bool offscreen) {
         }
     }
     DrawBoundary(app);
-    if (!offscreen && showEventAreas && appState == AppState::Running && !app.IsRecording())
-        DrawEventAreas(app);
 
     // Batch rendering (see AdvanceRendering) never touches the swapchain/window at all — offscreen
     // draws+captures every frame unconditionally instead, so it can't be throttled by vsync or by
@@ -1559,13 +2068,7 @@ int main(int, char**) {
     RefreshUserPresets();
 
     app.Init(Config::WindowTitle, Config::WindowWidth, Config::WindowHeight);
-    app.SetUICallback([]() {
-        switch (appState) {
-            case AppState::Menu:      DrawMenu(); break;
-            case AppState::Running:   DrawRunningOverlay(); break;
-            case AppState::Rendering: DrawRenderingOverlay(); break;
-        }
-    });
+    app.SetUICallback([]() { DrawUi(); });
 
     objects.reserve(100000);
     keByFrame.reserve(1u << 16); // avoid mid-run reallocations from skewing frame timing

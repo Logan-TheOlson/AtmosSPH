@@ -1,4 +1,5 @@
 #include <algorithm>
+#include "util/ColorPattern.h"
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -413,14 +414,32 @@ static void CalculatePressureForce (int32_t k)
 // ------------- Simulation
 void Init() {
     const auto& particles = ActiveScene.particles;
-    const auto& spawn     = ActiveScene.spawn;
+    auto&       spawn     = ActiveScene.spawn;
 
     const float radius  = particles.circleRadius;
-    const float spacing = radius * 3.0f;
+    const float spacing = radius * 3.0f * spawn.spacingScale;
+    if (spawn.fillBoundary && !spawn.circular) {
+        spawn.gridCountX = std::max(static_cast<int>(2.f * ScreenHalfWidth()  / spacing), 1);
+        spawn.gridCountY = std::max(static_cast<int>(2.f * ScreenHalfHeight() / spacing), 1);
+    }
     const float centerX = spawn.offsetXFrac * ScreenHalfWidth();
 
+    // The block the spawn lattice occupies — the frame a color pattern is laid over.
+    const float blockHalfW = spawn.circular ? spacing * std::sqrt(static_cast<float>(spawn.gridCountX * spawn.gridCountY) / Pi)
+                                            : spawn.gridCountX * spacing * 0.5f;
+    const float blockHalfH = spawn.circular ? blockHalfW : spawn.gridCountY * spacing * 0.5f;
+    const PatternSampler pattern(ActiveScene.colorPattern, centerX - blockHalfW, -blockHalfH, centerX + blockHalfW, blockHalfH);
+
     auto spawnAt = [&](float x, float y) {
-        CreateObject(x, y, Renderable{ .color = particles.circleColor, .shader = Shader::Circle, .geometry = Circle{radius} });
+        Object& o = CreateObject(x, y, Renderable{ .color = particles.circleColor, .shader = Shader::Circle, .geometry = Circle{radius} });
+        if (Color pc; pattern.Sample(x, y, pc)) { o.renderable.color = pc; o.pinnedColor = true; }
+        for (const SceneColorRegion& r : ActiveScene.colorRegions) {
+            const float dx = x - r.cx, dy = y - r.cy;
+            const bool inside = r.shape == EventShape::Circle
+                ? dx * dx + dy * dy <= r.radius * r.radius
+                : std::fabs(dx) <= r.halfW && std::fabs(dy) <= r.halfH;
+            if (inside) { o.renderable.color = r.color; o.pinnedColor = true; }
+        }
     };
 
     if (spawn.circular) {

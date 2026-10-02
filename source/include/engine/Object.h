@@ -11,6 +11,8 @@ struct Object {
     Renderable renderable;
     float density = 0.f;
     float pressure = 0.f;
+    // Set at spawn by a SceneColorRegion: just a marker; color-by modes override it.
+    bool  pinnedColor = false;
 
     float Radius() const;
     // colorOverride, when non-null, is drawn instead of renderable.color — used to recolor

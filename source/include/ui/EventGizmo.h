@@ -27,6 +27,10 @@ namespace EventGizmo {
         double                   simTime  = 0.0;
         bool                     live     = false;    // live run (new events start now) vs. pre-run preview
         bool                     interactive = true;  // false: draw only (e.g. while batch rendering)
+        // Reuse for plain areas (SceneColorRegion edited through SceneEvent proxies): no push
+        // arrow/handle, and an optional per-area tint replacing the mode colors.
+        bool                     showArrows = true;
+        const std::vector<ImVec4>* colors   = nullptr;
     };
 
     struct Result {

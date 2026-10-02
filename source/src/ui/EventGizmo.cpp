@@ -134,7 +134,10 @@ namespace {
         ty = e.cy + dirY * px;
     }
 
-    ImVec4 EventColor(const SceneEvent& e) { return e.mode == EventMode::Once ? Theme::Amber : Theme::Violet; }
+    ImVec4 EventColor(const SceneEvent& e) { return e.mode == EventMode::Once ? Theme::Amber : e.mode == EventMode::Field ? Theme::Teal : Theme::Violet; }
+
+    // The push arrow/handle belongs to uniform-acceleration events only (a field has no single direction).
+    bool HasArrow(const Context& c, const SceneEvent& e) { return c.showArrows && e.mode != EventMode::Field; }
 
     bool IsActive(const Context& c, size_t i) {
         const SceneEvent& e = (*c.events)[i];
@@ -145,13 +148,12 @@ namespace {
 
     float Dist(float ax, float ay, float bx, float by) { return std::hypot(ax - bx, ay - by); }
 
-    void DrawArrow(ImDrawList* dl, const ImVec2& from, const ImVec2& to, ImU32 col, float thickness) {
+    void DrawArrow(ImDrawList* dl, const ImVec2& from, const ImVec2& to, ImU32 col, float thickness, float head = 12.f) {
         dl->AddLine(from, to, col, thickness);
         const float dx = to.x - from.x, dy = to.y - from.y;
         const float len = std::hypot(dx, dy);
         if (len < 1.f) return;
         const float ux = dx / len, uy = dy / len;
-        const float head = 12.f;
         dl->AddTriangleFilled(to,
             ImVec2(to.x - ux * head - uy * head * 0.55f, to.y - uy * head + ux * head * 0.55f),
             ImVec2(to.x - ux * head + uy * head * 0.55f, to.y - uy * head - ux * head * 0.55f), col);
@@ -220,7 +222,7 @@ Result Update(const Context& ctx) {
             const SceneEvent& e = events[selected];
             float tx, ty;
             ArrowTip(e, tx, ty);
-            if (NearHandle(v, tx, ty, mouse)) { hit = Hit::Arrow; hitIndex = selected; }
+            if (HasArrow(ctx, e) && NearHandle(v, tx, ty, mouse)) { hit = Hit::Arrow; hitIndex = selected; }
             else for (Handle h : AllHandles) {
                 if (!HandleApplies(e, h)) continue;
                 float hx, hy;
@@ -256,7 +258,7 @@ Result Update(const Context& ctx) {
         }
     }
 
-    if (st.mode != Drag::None) {
+    if (ctx.interactive && st.mode != Drag::None) {
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
             st.mode = Drag::None;
         } else if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -309,9 +311,11 @@ Result Update(const Context& ctx) {
         const bool isSel   = static_cast<int>(i) == selected;
         const bool isHover = hit != Hit::None && hitIndex == static_cast<int>(i);
         const bool active  = IsActive(ctx, i);
-        const ImVec4 col   = EventColor(e);
+        const bool   tinted = ctx.colors && i < ctx.colors->size();
+        const ImVec4 col   = tinted ? (*ctx.colors)[i] : EventColor(e);
 
-        const float fillA = active ? 0.30f : (isSel || isHover ? 0.20f : 0.12f);
+        const float fillA = tinted ? (isSel || isHover ? 0.55f : 0.40f)
+                                   : active ? 0.30f : (isSel || isHover ? 0.20f : 0.12f);
         DrawArea(dl, v, e, Theme::U32(Theme::WithAlpha(col, fillA)),
                  Theme::U32(Theme::WithAlpha(col, isSel ? 1.f : 0.75f)), isSel ? 3.f : 2.f);
 
@@ -323,10 +327,29 @@ Result Update(const Context& ctx) {
         std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(i) + 1);
         DrawLabel(dl, ImVec2(topLeftX + 6.f, topLeftY + 6.f), buf, col);
 
+        if (e.mode == EventMode::Field) {
+            // Sample the field on a 5x5 lattice over the bounding box and draw its direction.
+            const float bw = e.shape == EventShape::Circle ? e.radius : e.halfW;
+            const float bh = e.shape == EventShape::Circle ? e.radius : e.halfH;
+            const ImU32 gc = Theme::U32(Theme::WithAlpha(col, isSel ? 1.f : 0.8f));
+            for (int iy = 0; iy < 5; iy++)
+                for (int ix = 0; ix < 5; ix++) {
+                    const float wx = e.cx + (ix - 2) * 0.4f * bw, wy = e.cy + (iy - 2) * 0.4f * bh;
+                    float ax, ay;
+                    if (!EventFieldAccel(e, wx, wy, ax, ay)) continue;
+                    const float len = std::hypot(ax, ay);
+                    if (len < 1e-3f) continue;
+                    const float scr = 9.f * std::min(1.f, 0.35f + len / std::max(std::fabs(e.strength), 1.f) * 0.65f);
+                    const ImVec2 f = ToScreen(v, wx, wy);
+                    DrawArrow(dl, ImVec2(f.x - ax / len * scr, f.y + ay / len * scr),
+                              ImVec2(f.x + ax / len * scr, f.y - ay / len * scr), gc, 1.5f, 5.f);
+                }
+        }
+
         // Push direction/strength arrow, always shown (it is the event's whole point).
         float tx, ty;
         ArrowTip(e, tx, ty);
-        const bool aimed = e.accel.x != 0.f || e.accel.y != 0.f;
+        const bool aimed = HasArrow(ctx, e) && (e.accel.x != 0.f || e.accel.y != 0.f);
         if (aimed) DrawArrow(dl, c, ToScreen(v, tx, ty), Theme::U32(Theme::WithAlpha(col, isSel ? 1.f : 0.85f)), isSel ? 3.f : 2.f);
 
         if (isSel) {
@@ -337,16 +360,18 @@ Result Update(const Context& ctx) {
                 const bool hot = (hit == Hit::Resize && hitHandle == h) || (st.mode == Drag::Resize && st.handle == h);
                 DrawHandle(dl, ToScreen(v, hx, hy), col, hot);
             }
-            DrawHandle(dl, ToScreen(v, tx, ty), Theme::Accent, hit == Hit::Arrow || st.mode == Drag::Arrow);
+            if (HasArrow(ctx, e)) {
+                DrawHandle(dl, ToScreen(v, tx, ty), Theme::Accent, hit == Hit::Arrow || st.mode == Drag::Arrow);
 
-            const float mag = std::hypot(e.accel.x, e.accel.y);
-            std::snprintf(buf, sizeof(buf), e.mode == EventMode::Once ? "%.0f px/s kick" : "%.0f px/s^2", mag);
-            const ImVec2 ts = ToScreen(v, tx, ty);
-            DrawLabel(dl, ImVec2(ts.x + 12.f, ts.y - 12.f), buf, col);
+                const float mag = std::hypot(e.accel.x, e.accel.y);
+                std::snprintf(buf, sizeof(buf), e.mode == EventMode::Once ? "%.0f px/s kick" : "%.0f px/s^2", mag);
+                const ImVec2 ts = ToScreen(v, tx, ty);
+                DrawLabel(dl, ImVec2(ts.x + 12.f, ts.y - 12.f), buf, col);
+            }
         }
     }
 
-    if (st.mode == Drag::Create) {
+    if (ctx.interactive && st.mode == Drag::Create) {
         DrawArea(dl, v, st.preview, Theme::U32(Theme::WithAlpha(Theme::Accent, 0.16f)), Theme::U32(Theme::Accent), 2.f);
     }
 
@@ -357,14 +382,16 @@ Result Update(const Context& ctx) {
         ImGui::SetMouseCursor(hit == Hit::Body   ? ImGuiMouseCursor_ResizeAll
                             : hit == Hit::Resize ? HandleCursor(hitHandle)
                                                  : ImGuiMouseCursor_Hand);
-        if (hit == Hit::Body && hitIndex >= 0) {
+        if (hit == Hit::Body && hitIndex >= 0 && !ctx.showArrows) {
+            ImGui::SetTooltip("Persistent color area %d\nDrag to move  -  Del to delete", hitIndex + 1);
+        } else if (hit == Hit::Body && hitIndex >= 0) {
             const SceneEvent& e = events[hitIndex];
             ImGui::SetTooltip("Event %d  -  %s  -  %s\nstart %.1fs%s\nDrag to move  -  Del to delete",
                 hitIndex + 1, e.shape == EventShape::Circle ? "circle" : "rect",
-                e.mode == EventMode::Once ? "one-shot kick" : "continuous push", e.startTime,
-                e.mode == EventMode::Continuous && e.duration > 0.f ? " (limited duration)" : "");
+                e.mode == EventMode::Once ? "one-shot kick" : e.mode == EventMode::Field ? "force field" : "continuous push", e.startTime,
+                e.mode != EventMode::Once && e.duration > 0.f ? " (limited duration)" : "");
         }
-    } else if (st.mode != Drag::None) {
+    } else if (ctx.interactive && st.mode != Drag::None) {
         ImGui::SetMouseCursor(st.mode == Drag::Create ? ImGuiMouseCursor_Arrow
                             : st.mode == Drag::Move   ? ImGuiMouseCursor_ResizeAll
                             : st.mode == Drag::Resize ? HandleCursor(st.handle)
