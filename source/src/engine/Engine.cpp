@@ -538,17 +538,6 @@ static void DrawParticlesSection(SceneParticles& pr, float contentWidth) {
     FormRow(contentWidth, "Circle radius");
     ImGui::InputFloat("##Circle radius", &pr.circleRadius);
 
-    // Label on the left, swatch pinned to the content's right edge, same NoInputs-swatch pattern
-    // DrawColorByControls uses for its Low/High rows — a full ColorEdit4 (4 numeric fields plus a
-    // swatch) is wider than contentWidth allows room for a trailing label at all.
-    {
-        const float swatchSize = ImGui::GetFrameHeight();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Circle color");
-        ImGui::SameLine(contentWidth - swatchSize);
-        ImGui::ColorEdit4("##circlecolor", &pr.circleColor.r, ImGuiColorEditFlags_NoInputs);
-    }
-
     FormRow(contentWidth, "Smoothing radius");
     ImGui::InputFloat("##Smoothing radius", &pr.smoothingRadius);
     FormRow(contentWidth, "Target density");
@@ -1447,6 +1436,15 @@ static void DrawColorPatternSection(SceneColorPattern& p, float w) {
 static void DrawColorRegionsPanel() {
     {
         const float pw = ImGui::GetContentRegionAvail().x;
+        // Base color for particles no pattern/area recolors. Label on the left, swatch pinned to the right
+        // edge (a full ColorEdit4 is too wide for a trailing label).
+        Widgets::Caption("BASE COLOR");
+        const float swatchSize = ImGui::GetFrameHeight();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Particle color");
+        ImGui::SameLine(pw - swatchSize);
+        ImGui::ColorEdit4("##circlecolor", &menuConfig.scene.particles.circleColor.r, ImGuiColorEditFlags_NoInputs);
+        ImGui::Spacing();
         Widgets::Caption("PATTERN");
         DrawColorPatternSection(menuConfig.scene.colorPattern, pw);
         ImGui::Spacing();
@@ -1466,6 +1464,18 @@ static void DrawColorRegionsPanel() {
         r.cx = 0.f; r.cy = 0.f;
         regions.push_back(r);
         selectedRegion = static_cast<int>(regions.size()) - 1;
+    }
+
+    ImGui::Checkbox("Blend colors", &menuConfig.scene.blendColorRegions);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Gradient between areas' colors (and between pattern cells) instead of hard edges");
+    if (menuConfig.scene.blendColorRegions) {
+        Scene& bs = menuConfig.scene;
+        FormRow(w, "Blend strength");
+        ImGui::SliderFloat("##blendStrength", &bs.blendStrength, 0.f, 1.f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = flat colors with hard edges, 1 = full gradient");
+        FormRow(w, "Blend radius (px)");
+        ImGui::SliderFloat("##blendRadius", &bs.blendRadius, 0.f, 1000.f, bs.blendRadius <= 0.f ? "Auto" : "%.0f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far the gradient reaches. 0 = automatic");
     }
 
     if (ImGui::CollapsingHeader("New area defaults")) {
@@ -1649,40 +1659,71 @@ static void DrawSimOverlay(const Workspace::Frame& frame) {
 
         const float spacing = s.particles.circleRadius * 3.f * s.spawn.spacingScale;
         const float cx = s.spawn.offsetXFrac * halfW;
-        const ImU32 fill = Theme::U32(Theme::WithAlpha(Theme::Accent, 0.22f));
-        const ImU32 line = Theme::U32(Theme::WithAlpha(Theme::Accent, 0.7f));
+        // Mirror Init(): a packed (fillBoundary) block is sized to the container, not to gridCount.
+        int countX = s.spawn.gridCountX, countY = s.spawn.gridCountY;
+        if (s.spawn.fillBoundary && !s.spawn.circular) {
+            countX = std::max(static_cast<int>(2.f * halfW / spacing), 1);
+            countY = std::max(static_cast<int>(2.f * halfH / spacing), 1);
+        }
+        const ImU32 fill = Theme::U32(Theme::WithAlpha(Theme::Accent, 0.10f));
+        const ImU32 line = Theme::U32(Theme::WithAlpha(Theme::Accent, 0.45f));
+        const float bw = s.spawn.circular ? spacing * std::sqrt(static_cast<float>(countX * countY) / 3.14159265f)
+                                          : countX * spacing * 0.5f;
+        const float bh = s.spawn.circular ? bw : countY * spacing * 0.5f;
         if (s.spawn.circular) {
-            const float r = spacing * std::sqrt(static_cast<float>(s.spawn.gridCountX * s.spawn.gridCountY) / 3.14159265f);
             const ImVec2 c(view.origin.x + cx * view.scale, view.origin.y);
-            dl->AddCircleFilled(c, r * view.scale, fill, 96);
-            dl->AddCircle(c, r * view.scale, line, 96, 2.f);
+            dl->AddCircleFilled(c, bw * view.scale, fill, 96);
+            dl->AddCircle(c, bw * view.scale, line, 96, 1.5f);
         } else {
-            const float bw = s.spawn.gridCountX * spacing * 0.5f, bh = s.spawn.gridCountY * spacing * 0.5f;
             const ImVec2 pa(view.origin.x + (cx - bw) * view.scale, view.origin.y - bh * view.scale);
             const ImVec2 pb(view.origin.x + (cx + bw) * view.scale, view.origin.y + bh * view.scale);
             dl->AddRectFilled(pa, pb, fill, 8.f);
-            dl->AddRect(pa, pb, line, 8.f, 0, 2.f);
+            dl->AddRect(pa, pb, line, 8.f, 0, 1.5f);
         }
-        if (s.colorPattern.kind != ColorPatternKind::None) {
-            // Coarse sample grid over the spawn block, so the pattern shows before the run starts.
-            const float bw = s.spawn.circular ? spacing * std::sqrt(static_cast<float>(s.spawn.gridCountX * s.spawn.gridCountY) / 3.14159265f)
-                                              : s.spawn.gridCountX * spacing * 0.5f;
-            const float bh = s.spawn.circular ? bw : s.spawn.gridCountY * spacing * 0.5f;
-            const PatternSampler sampler(s.colorPattern, cx - bw, -bh, cx + bw, bh);
-            const float step = std::max(std::max(bw, bh) / 70.f, 2.f);
-            for (float wy = -bh + step * 0.5f; wy < bh; wy += step)
-                for (float wx = cx - bw + step * 0.5f; wx < cx + bw; wx += step) {
-                    if (s.spawn.circular && std::hypot(wx - cx, wy) > bw) continue;
-                    Color pc;
-                    if (!sampler.Sample(wx, wy, pc)) continue;
+
+        // Coarse lattice-aligned sample grid colored exactly as Init()'s spawnAt colors particles.
+        const PatternSampler sampler(s.colorPattern, cx - bw, -bh, cx + bw, bh,
+                                     s.blendColorRegions ? s.blendStrength : 0.f, s.blendRadius);
+        auto previewColor = [&](float x, float y) {
+            Color c = s.particles.circleColor;
+            if (Color pc; sampler.Sample(x, y, pc)) c = pc;
+            if (s.blendColorRegions) {
+                BlendColorRegions(s.colorRegions, x, y, c, s.blendStrength, s.blendRadius);
+                return c;
+            }
+            for (const SceneColorRegion& r : s.colorRegions) {
+                const float dx = x - r.cx, dy = y - r.cy;
+                const bool inside = r.shape == EventShape::Circle
+                    ? dx * dx + dy * dy <= r.radius * r.radius
+                    : std::fabs(dx) <= r.halfW && std::fabs(dy) <= r.halfH;
+                if (inside) c = r.color;
+            }
+            return c;
+        };
+        const float stride = spacing * std::max(1.f, std::round(std::max(bw, bh) / 70.f / spacing));
+        const float hs = stride * 0.5f * view.scale;
+        const float startX = cx - (countX - 1) * spacing * 0.5f;
+        const float startY = -(countY - 1) * spacing * 0.5f;
+        if (s.spawn.circular) {
+            for (float wy = -bh + stride * 0.5f; wy < bh; wy += stride)
+                for (float wx = cx - bw + stride * 0.5f; wx < cx + bw; wx += stride) {
+                    if (std::hypot(wx - cx, wy) > bw) continue;
+                    const Color pc = previewColor(wx, wy);
                     const ImVec2 q(view.origin.x + wx * view.scale, view.origin.y - wy * view.scale);
-                    const float hs = step * 0.5f * view.scale + 0.5f;
                     dl->AddRectFilled(ImVec2(q.x - hs, q.y - hs), ImVec2(q.x + hs, q.y + hs),
-                                      ImGui::ColorConvertFloat4ToU32(ImVec4(pc.r, pc.g, pc.b, 0.85f)));
+                                      ImGui::ColorConvertFloat4ToU32(ImVec4(pc.r, pc.g, pc.b, 0.5f)));
+                }
+        } else {
+            for (float wy = startY; wy <= -startY + 0.01f; wy += stride)
+                for (float wx = startX; wx <= cx + (countX - 1) * spacing * 0.5f + 0.01f; wx += stride) {
+                    const Color pc = previewColor(wx, wy);
+                    const ImVec2 q(view.origin.x + wx * view.scale, view.origin.y - wy * view.scale);
+                    dl->AddRectFilled(ImVec2(q.x - hs, q.y - hs), ImVec2(q.x + hs, q.y + hs),
+                                      ImGui::ColorConvertFloat4ToU32(ImVec4(pc.r, pc.g, pc.b, 0.5f)));
                 }
         }
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "%d particles", s.spawn.gridCountX * s.spawn.gridCountY);
+        std::snprintf(buf, sizeof(buf), "%d particles", countX * countY);
         dl->AddText(ImVec2(a.x + 14.f, a.y + 10.f), Theme::U32(Theme::TextDim), buf);
         dl->PopClipRect();
     }

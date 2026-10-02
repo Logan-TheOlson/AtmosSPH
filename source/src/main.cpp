@@ -428,11 +428,16 @@ void Init() {
     const float blockHalfW = spawn.circular ? spacing * std::sqrt(static_cast<float>(spawn.gridCountX * spawn.gridCountY) / Pi)
                                             : spawn.gridCountX * spacing * 0.5f;
     const float blockHalfH = spawn.circular ? blockHalfW : spawn.gridCountY * spacing * 0.5f;
-    const PatternSampler pattern(ActiveScene.colorPattern, centerX - blockHalfW, -blockHalfH, centerX + blockHalfW, blockHalfH);
+    const PatternSampler pattern(ActiveScene.colorPattern, centerX - blockHalfW, -blockHalfH, centerX + blockHalfW, blockHalfH,
+                                 ActiveScene.blendColorRegions ? ActiveScene.blendStrength : 0.f, ActiveScene.blendRadius);
 
     auto spawnAt = [&](float x, float y) {
         Object& o = CreateObject(x, y, Renderable{ .color = particles.circleColor, .shader = Shader::Circle, .geometry = Circle{radius} });
         if (Color pc; pattern.Sample(x, y, pc)) { o.renderable.color = pc; o.pinnedColor = true; }
+        if (ActiveScene.blendColorRegions) {
+            if (Color bc = o.renderable.color; BlendColorRegions(ActiveScene.colorRegions, x, y, bc, ActiveScene.blendStrength, ActiveScene.blendRadius)) { o.renderable.color = bc; o.pinnedColor = true; }
+            return;
+        }
         for (const SceneColorRegion& r : ActiveScene.colorRegions) {
             const float dx = x - r.cx, dy = y - r.cy;
             const bool inside = r.shape == EventShape::Circle

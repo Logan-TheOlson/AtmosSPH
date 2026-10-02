@@ -48,33 +48,42 @@ namespace {
     }
 }
 
-PatternSampler::PatternSampler(const SceneColorPattern& pattern, float x0, float y0, float x1, float y1)
-    : p(pattern), minX(x0), minY(y0), maxX(x1), maxY(y1) {
+PatternSampler::PatternSampler(const SceneColorPattern& pattern, float x0, float y0, float x1, float y1,
+                               float strength, float radius)
+    : p(pattern), minX(x0), minY(y0), maxX(x1), maxY(y1),
+      blendStrength(std::clamp(strength, 0.f, 1.f)), blendRadius(radius) {
     if (p.kind == ColorPatternKind::Image) image = LoadCached(p.imagePath);
 }
 
 bool PatternSampler::Sample(float x, float y, Color& out) const {
     const float cell = std::max(p.cellSize, 1.f);
     const float w = maxX - minX, h = maxY - minY;
+    // 1D alternating wave over cells of width `cell`: +1 in A cells, -1 in B cells. With blending on it
+    // passes linearly through 0 at each boundary, reaching +-1 `halfWidth` px away, so neighbors gradient.
+    const float halfWidth = blendRadius > 0.f ? std::min(blendRadius, cell * 0.5f) : cell * 0.5f;
+    auto wave = [&](float u) {
+        const float q = u / cell;
+        const float cellIdx = std::floor(q);
+        const float sign = (static_cast<long>(cellIdx) & 1) ? -1.f : 1.f;
+        if (blendStrength <= 0.f) return sign;
+        const float dist = std::min(q - cellIdx, 1.f - (q - cellIdx)) * cell;
+        const float soft = sign * std::clamp(dist / halfWidth, 0.f, 1.f);
+        return sign + (soft - sign) * blendStrength;
+    };
+    auto pick = [&](float s) { out = Lerp(p.colorA, p.colorB, (1.f - s) * 0.5f); return true; };
     switch (p.kind) {
         case ColorPatternKind::None:
             return false;
         case ColorPatternKind::VStripes:
-            out = (static_cast<long>(std::floor((x - minX) / cell)) & 1) ? p.colorB : p.colorA;
-            return true;
+            return pick(wave(x - minX));
         case ColorPatternKind::HStripes:
-            out = (static_cast<long>(std::floor((y - minY) / cell)) & 1) ? p.colorB : p.colorA;
-            return true;
+            return pick(wave(y - minY));
         case ColorPatternKind::Checker: {
-            const long ix = static_cast<long>(std::floor((x - minX) / cell));
-            const long iy = static_cast<long>(std::floor((y - minY) / cell));
-            out = ((ix + iy) & 1) ? p.colorB : p.colorA;
-            return true;
+            return pick(wave(x - minX) * wave(y - minY));
         }
         case ColorPatternKind::Rings: {
             const float r = std::hypot(x - (minX + maxX) * 0.5f, y - (minY + maxY) * 0.5f);
-            out = (static_cast<long>(std::floor(r / cell)) & 1) ? p.colorB : p.colorA;
-            return true;
+            return pick(wave(r));
         }
         case ColorPatternKind::Gradient:
             out = Lerp(p.colorA, p.colorB, w > 0.f ? std::clamp((x - minX) / w, 0.f, 1.f) : 0.f);

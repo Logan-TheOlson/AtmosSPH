@@ -192,6 +192,65 @@ struct SceneColorRegion {
     Color color = { 1.f, 0.3f, 0.2f, 1.f };
 };
 
+// Blend mode for SceneColorRegions (and, via PatternSampler, the stripe/checker/ring patterns). Two parts:
+//  * Color: a gradient between the areas' *centers* -- each area's weight is its reach / (distance to its center),
+//    which for two areas is a straight linear lerp along the line joining them (pure color at each center),
+//    like the Gradient pattern. Overlaps are not stacked: where areas overlap, only the topmost (last in
+//    the list) takes part, the ones it covers are ignored there.
+//  * Coverage: that color is solid within the areas' footprint and ramps linearly back to `out` (which must
+//    hold the color the point would otherwise have, i.e. base/pattern) over a band beyond the edge.
+// `strength` (0..1) is how far the gradient replaces the area's own flat color inside it, and how much
+// of the fade beyond the edge is applied (0 = hard-edged patches). `radius` (px) is the width of that band;
+// <= 0 = automatic (50% of the area's smaller half-size). Each area's reach is independent of the others;
+// the gradient between areas appears where their reaches overlap.
+// Returns false (out untouched) for points no area reaches.
+inline bool BlendColorRegions(const std::vector<SceneColorRegion>& regions, float x, float y, Color& out,
+                              float strength = 1.f, float radius = 0.f) {
+    auto edgeDist = [&](const SceneColorRegion& r, float& size) {
+        const float dx = x - r.cx, dy = y - r.cy;
+        if (r.shape == EventShape::Circle) {
+            size = r.radius;
+            return std::max(std::sqrt(dx * dx + dy * dy) - r.radius, 0.f);
+        }
+        size = std::min(r.halfW, r.halfH);
+        const float ex = std::max(std::fabs(dx) - r.halfW, 0.f), ey = std::max(std::fabs(dy) - r.halfH, 0.f);
+        return std::sqrt(ex * ex + ey * ey);
+    };
+    strength = std::clamp(strength, 0.f, 1.f);
+    int top = -1;  // topmost area containing the point
+    for (int i = 0; i < static_cast<int>(regions.size()); i++) {
+        float size;
+        if (edgeDist(regions[static_cast<size_t>(i)], size) <= 0.f) top = i;
+    }
+    float sr = 0.f, sg = 0.f, sb = 0.f, sa = 0.f, sw = 0.f, cover = 0.f;
+    for (int i = 0; i < static_cast<int>(regions.size()); i++) {
+        const SceneColorRegion& r = regions[static_cast<size_t>(i)];
+        float size;
+        const float d = edgeDist(r, size);
+        if (d <= 0.f && i != top) continue;  // covered by a region above it
+        // Each area's reach is its own (independent of the other areas): solid inside, linear fade over `band`.
+        const float band = radius > 0.f ? radius : std::max(size * 0.5f, 1.f);
+        const float c = d <= 0.f ? 1.f : std::clamp(1.f - d / band, 0.f, 1.f) * strength;
+        if (c <= 0.f) continue;
+        // Colors mix by reach / distance-to-center, so an area only tints points it actually reaches and,
+        // where reaches overlap, the colors gradient between the centers.
+        const float w = c / std::max(std::hypot(x - r.cx, y - r.cy), 1.f);
+        sr += r.color.r * w; sg += r.color.g * w; sb += r.color.b * w; sa += r.color.a * w; sw += w;
+        cover = std::max(cover, c);
+    }
+    if (sw <= 0.f || cover <= 0.f) return false;
+    const float inv = 1.f / sw;
+    Color grad = { sr * inv, sg * inv, sb * inv, sa * inv };
+    if (top >= 0) {  // inside: strength picks between the area's flat color and the gradient
+        const Color& flat = regions[static_cast<size_t>(top)].color;
+        grad = { flat.r + (grad.r - flat.r) * strength, flat.g + (grad.g - flat.g) * strength,
+                 flat.b + (grad.b - flat.b) * strength, flat.a + (grad.a - flat.a) * strength };
+    }
+    out = { out.r + (grad.r - out.r) * cover, out.g + (grad.g - out.g) * cover,
+            out.b + (grad.b - out.b) * cover, out.a + (grad.a - out.a) * cover };
+    return true;
+}
+
 // A persistent-color pattern laid over the whole spawn block (before SceneColorRegions, which win where
 // they overlap). Like regions, colors are assigned at spawn and never change during the run.
 enum class ColorPatternKind { None, VStripes, HStripes, Checker, Rings, Gradient, Image };
@@ -225,6 +284,9 @@ struct Scene {
 
     std::vector<SceneEvent> events;
     std::vector<SceneColorRegion> colorRegions;
+    bool  blendColorRegions = false; // gradient between areas / pattern cells instead of hard patches (BlendColorRegions)
+    float blendStrength     = 1.f;   // 0..1: how much of the gradient is applied
+    float blendRadius       = 0.f;   // px: distance the gradient reaches; 0 = automatic
     SceneColorPattern colorPattern;
 };
 
