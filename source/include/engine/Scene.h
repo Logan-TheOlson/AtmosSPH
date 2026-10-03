@@ -192,6 +192,133 @@ struct SceneColorRegion {
     Color color = { 1.f, 0.3f, 0.2f, 1.f };
 };
 
+// A solid obstacle: no particle spawns inside it (Init), and during the run it is a wall particles
+// bounce off (Integrate) and mirror-image across for SPH density (main.cpp's ForEachObstacleGhost).
+// Coordinates are world pixels (origin = window center, +y up), same as SceneEvent.
+struct SceneObstacle {
+    EventShape shape = EventShape::Circle;
+    float cx = 0.f, cy = 0.f;
+    float radius = 100.f;                // Circle
+    float halfW = 100.f, halfH = 100.f;  // Rect
+    Color color = { 0.55f, 0.58f, 0.65f, 1.f };
+};
+
+// Signed distance from (x, y) to the obstacle's surface (negative inside) and the outward unit
+// normal there. Outside a rect's corner the normal points diagonally (a rounded corner of any
+// margin); inside, it is the axis of the nearest face. Callers treat `sd < margin` as touching.
+inline float ObstacleSurface(const SceneObstacle& o, float x, float y, float& nx, float& ny) {
+    const float dx = x - o.cx, dy = y - o.cy;
+    if (o.shape == EventShape::Circle) {
+        const float d = std::sqrt(dx * dx + dy * dy);
+        if (d > 1e-6f) { nx = dx / d; ny = dy / d; }
+        else           { nx = 0.f;    ny = 1.f; }
+        return d - o.radius;
+    }
+    const float qx = std::fabs(dx) - o.halfW, qy = std::fabs(dy) - o.halfH;
+    const float sx = dx < 0.f ? -1.f : 1.f, sy = dy < 0.f ? -1.f : 1.f;
+    if (qx > 0.f || qy > 0.f) {
+        const float ox = std::max(qx, 0.f), oy = std::max(qy, 0.f);
+        const float d  = std::sqrt(ox * ox + oy * oy);
+        nx = sx * ox / d; ny = sy * oy / d;
+        return d;
+    }
+    if (qx > qy) { nx = sx;  ny = 0.f; return qx; }
+    nx = 0.f; ny = sy; return qy;
+}
+
+// True if a point (grown by `margin`, e.g. the particle radius) lies inside any obstacle.
+inline bool InsideAnyObstacle(const std::vector<SceneObstacle>& obstacles, float x, float y, float margin = 0.f) {
+    float nx, ny;
+    for (const SceneObstacle& o : obstacles)
+        if (ObstacleSurface(o, x, y, nx, ny) < margin) return true;
+    return false;
+}
+
+// A block of starting particles: a square lattice filling a rect, or a Fibonacci-spiral disk for a
+// circle, at spacing 3 * circleRadius * spacingScale. A Scene with `useGroups` spawns exactly its
+// groups (none = an empty scene); without it, Init() derives one group from SceneSpawn instead
+// (SpawnBlockAsGroup). Coordinates are world pixels (origin = window center, +y up).
+struct SceneGroup {
+    EventShape shape = EventShape::Rect;
+    float cx = 0.f, cy = 0.f;
+    float radius = 100.f;                // Circle
+    float halfW = 100.f, halfH = 100.f;  // Rect
+    float spacingScale = 1.f;            // < 1 packs tighter (starts compressed), like SceneSpawn::spacingScale
+    bool  customColor = false;           // false: the scene's particle color (particles.circleColor)
+    Color color = { 0.2f, 0.6f, 1.0f, 1.0f };
+};
+
+inline constexpr int MaxSpawnParticles = 1'000'000; // per group; keeps typos from allocating gigabytes
+
+inline float GroupSpacing(const SceneGroup& g, float circleRadius) {
+    return circleRadius * 3.f * std::max(g.spacingScale, 0.1f);
+}
+
+// Lattice dimensions of a rect group (0 x 0 if the rect is empty or the spacing degenerate).
+inline void GroupGrid(const SceneGroup& g, float spacing, int& nx, int& ny) {
+    nx = ny = 0;
+    if (!(spacing > 0.f) || !(g.halfW > 0.f) || !(g.halfH > 0.f)) return;
+    // +1e-3 so a block sized as exactly N spacings isn't rounded down to N-1 by float error.
+    const float fx = 2.f * g.halfW / spacing + 1e-3f, fy = 2.f * g.halfH / spacing + 1e-3f;
+    if (!std::isfinite(fx) || !std::isfinite(fy)) return;
+    nx = std::clamp(static_cast<int>(std::min(fx, static_cast<float>(MaxSpawnParticles))), 1, MaxSpawnParticles);
+    ny = std::clamp(static_cast<int>(std::min(fy, static_cast<float>(MaxSpawnParticles))), 1, MaxSpawnParticles / nx);
+}
+
+inline int GroupCircleCount(const SceneGroup& g, float spacing) {
+    if (!(spacing > 0.f) || !(g.radius > 0.f)) return 0;
+    const float c = 3.14159265f * g.radius * g.radius / (spacing * spacing) + 0.5f;
+    return std::isfinite(c) ? static_cast<int>(std::min(c, static_cast<float>(MaxSpawnParticles))) : 0;
+}
+
+inline int GroupParticleCount(const SceneGroup& g, float spacing) {
+    if (g.shape == EventShape::Circle) return GroupCircleCount(g, spacing);
+    int nx, ny;
+    GroupGrid(g, spacing, nx, ny);
+    return nx * ny;
+}
+
+// Resizes the group (keeping its center, shape and a rect's aspect ratio) so that at `spacing` it
+// holds about `count` particles — more particles means a bigger block, not a denser one.
+inline void ResizeGroupToCount(SceneGroup& g, float spacing, int count) {
+    if (!(spacing > 0.f)) return;
+    count = std::clamp(count, 1, MaxSpawnParticles);
+    const float area = static_cast<float>(count) * spacing * spacing; // one particle per spacing^2
+    if (g.shape == EventShape::Circle) {
+        g.radius = std::sqrt(area / 3.14159265f);
+    } else {
+        const float aspect = (g.halfW > 0.f && g.halfH > 0.f) ? g.halfW / g.halfH : 1.f;
+        g.halfH = 0.5f * std::sqrt(area / aspect);
+        g.halfW = g.halfH * aspect;
+    }
+}
+
+// Calls fn(x, y) for every particle position of the group at `spacing` (the UI preview passes a
+// coarser spacing to sample the same shape cheaply).
+template <typename Fn>
+inline void ForEachGroupPoint(const SceneGroup& g, float spacing, Fn&& fn) {
+    if (g.shape == EventShape::Circle) {
+        // Exactly `count` particles in a disk of areal density 1 / spacing^2: a Fibonacci
+        // ("sunflower"/Vogel) spiral, not a square lattice masked by a circle (which only
+        // approximates the count).
+        const int   count = GroupCircleCount(g, spacing);
+        constexpr float GoldenAngle = 2.39996323f; // pi * (3 - sqrt(5))
+        for (int i = 0; i < count; i++) {
+            const float r     = g.radius * std::sqrt((static_cast<float>(i) + 0.5f) / static_cast<float>(count));
+            const float theta = static_cast<float>(i) * GoldenAngle;
+            fn(g.cx + r * std::cos(theta), g.cy + r * std::sin(theta));
+        }
+        return;
+    }
+    int nx, ny;
+    GroupGrid(g, spacing, nx, ny);
+    const float startX = g.cx - static_cast<float>(nx - 1) * spacing * 0.5f;
+    const float startY = g.cy - static_cast<float>(ny - 1) * spacing * 0.5f;
+    for (int x = 0; x < nx; x++)
+        for (int y = 0; y < ny; y++)
+            fn(startX + static_cast<float>(x) * spacing, startY + static_cast<float>(y) * spacing);
+}
+
 // Blend mode for SceneColorRegions (and, via PatternSampler, the stripe/checker/ring patterns). Two parts:
 //  * Color: a gradient between the areas' *centers* -- each area's weight is its reach / (distance to its center),
 //    which for two areas is a straight linear lerp along the line joining them (pure color at each center),
@@ -284,6 +411,9 @@ struct Scene {
 
     std::vector<SceneEvent> events;
     std::vector<SceneColorRegion> colorRegions;
+    std::vector<SceneObstacle>    obstacles;
+    bool                          useGroups = false; // true: spawn exactly `groups` (see SceneGroup)
+    std::vector<SceneGroup>       groups;
     bool  blendColorRegions = false; // gradient between areas / pattern cells instead of hard patches (BlendColorRegions)
     float blendStrength     = 1.f;   // 0..1: how much of the gradient is applied
     float blendRadius       = 0.f;   // px: distance the gradient reaches; 0 = automatic
@@ -298,6 +428,15 @@ extern const std::vector<Scene> ScenePresets;
 // SceneSpawn's fields on a copy, which would leave a resolution-dependent scene tuned for the
 // wrong count. gridCountX/Y are clamped to >= 1.
 Scene BuildScene(int presetIndex, int gridCountX, int gridCountY);
+
+// The legacy SceneSpawn block (grid counts, circular, offset, packing, fillBoundary) expressed as a
+// SceneGroup inside a container of the given half-extents. Clamps and writes the resulting grid
+// counts back into scene.spawn (fillBoundary derives them from the container). This is what Init()
+// spawns for a scene without groups, and what the menu seeds its editable groups from.
+SceneGroup SpawnBlockAsGroup(Scene& scene, float halfWidth, float halfHeight);
+
+// Total particles the scene will spawn (before obstacle culling), from its groups if it has them.
+int SceneParticleCount(const Scene& scene);
 
 // The scene currently governing physics/spawn/boundary. Mutable — set via LoadScene(), not
 // assigned directly, so derived SPH kernel constants (main.cpp's RecomputeSphConstants) stay in

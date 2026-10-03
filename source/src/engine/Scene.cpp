@@ -115,6 +115,18 @@ namespace {
         return s;
     }
 
+    // Open Tank's container and physics with no particles at all: a blank slate to build up from the
+    // Groups tab (plus events, obstacles and color areas).
+    Scene MakeEmpty() {
+        Scene s = MakeOpenTank();
+        s.name        = "Empty";
+        s.description = "Open Tank's container with no particles; add some in the Groups tab.";
+        s.useGroups   = true; // an empty group list means "spawn nothing", not "use the legacy block"
+        s.realTimeLimitX = 0;
+        s.realTimeLimitY = 0;
+        return s;
+    }
+
     // No external force at all — the only thing holding the block together (or pulling it apart)
     // is mutual N-body attraction between particles, via the genuine-2D treecode, plus SPH
     // pressure resisting the collapse. Default window boundaries (full-window box, free-slip
@@ -248,7 +260,7 @@ namespace {
 }
 
 const std::vector<Scene> ScenePresets = {
-    MakeOpenTank(), MakePoiseuille(), MakeSelfGravity(), MakePacked(),
+    MakeOpenTank(), MakePoiseuille(), MakeSelfGravity(), MakePacked(), MakeEmpty(),
 };
 
 Scene BuildScene(int presetIndex, int gridCountX, int gridCountY) {
@@ -259,8 +271,52 @@ Scene BuildScene(int presetIndex, int gridCountX, int gridCountY) {
         case 1:  return MakePoiseuille(gridCountX, gridCountY);
         case 2:  return MakeSelfGravity(gridCountX, gridCountY);
         case 3:  return MakePacked();
+        case 4:  return MakeEmpty();
         default: return ScenePresets[presetIndex];
     }
+}
+
+SceneGroup SpawnBlockAsGroup(Scene& scene, float halfWidth, float halfHeight) {
+    auto& spawn = scene.spawn;
+    const float spacing = scene.particles.circleRadius * 3.0f * spawn.spacingScale;
+    constexpr float Pi = 3.14159265358979323846f;
+
+    // Bounds the lattice so gridCountX * gridCountY can't overflow int and a typo can't ask for a
+    // multi-gigabyte allocation.
+    auto cellsAcross = [&](float extent) {
+        const float cells = 2.f * extent / spacing;
+        return std::isfinite(cells) ? static_cast<int>(std::min(cells, static_cast<float>(MaxSpawnParticles))) : 1;
+    };
+    if (spawn.fillBoundary && !spawn.circular) {
+        spawn.gridCountX = std::max(cellsAcross(halfWidth),  1);
+        spawn.gridCountY = std::max(cellsAcross(halfHeight), 1);
+    }
+    spawn.gridCountX = std::clamp(spawn.gridCountX, 1, MaxSpawnParticles);
+    spawn.gridCountY = std::clamp(spawn.gridCountY, 1, MaxSpawnParticles / spawn.gridCountX);
+
+    SceneGroup g;
+    g.spacingScale = spawn.spacingScale;
+    g.color        = scene.particles.circleColor; // shown by the gizmo; customColor stays off
+    g.cx = spawn.offsetXFrac * halfWidth;
+    g.cy = 0.f;
+    if (spawn.circular) {
+        // gridCountX * gridCountY particles on a disk of the lattice's areal density.
+        g.shape  = EventShape::Circle;
+        g.radius = spacing * std::sqrt(static_cast<float>(spawn.gridCountX * spawn.gridCountY) / Pi);
+    } else {
+        g.shape = EventShape::Rect;
+        g.halfW = static_cast<float>(spawn.gridCountX) * spacing * 0.5f;
+        g.halfH = static_cast<float>(spawn.gridCountY) * spacing * 0.5f;
+    }
+    return g;
+}
+
+int SceneParticleCount(const Scene& scene) {
+    if (!scene.useGroups) return scene.spawn.gridCountX * scene.spawn.gridCountY;
+    long long total = 0;
+    for (const SceneGroup& g : scene.groups)
+        total += GroupParticleCount(g, GroupSpacing(g, scene.particles.circleRadius));
+    return static_cast<int>(std::min<long long>(total, MaxSpawnParticles));
 }
 
 Scene ActiveScene = ScenePresets[0];

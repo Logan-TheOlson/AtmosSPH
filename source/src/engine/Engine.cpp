@@ -1,6 +1,9 @@
 ﻿#include <imgui_internal.h>
 #include <SDL3/SDL.h>
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 #include "util/ColorPattern.h"
 #include "engine/Engine.h"
 #include "engine/Scene.h"
@@ -23,7 +26,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -100,8 +105,7 @@ static void WriteVelocityProfileCsv() {
 }
 
 static App      app;
-static Profiler profiler;
-static bool     profilerOpen = false;
+static Profiler profiler; // frame/render timing, shown in the live panel's Run card
 
 // Simulation only advances in Running/Rendering; Menu leaves `objects` untouched (cleared) and
 // skips physics entirely so the menu screen never pays SPH cost. Rendering runs the same physics
@@ -432,12 +436,6 @@ static void FormRow(float contentWidth, const char* label) {
     ImGui::SetNextItemWidth(contentWidth - labelW);
 }
 
-static void DrawSpawnSection(SceneSpawn& spawn, float contentWidth) {
-    FormRow(contentWidth, "Offset X (frac)");
-    ImGui::SliderFloat("##Offset X (frac)", &spawn.offsetXFrac, -1.f, 1.f, "%.2f");
-    FormRow(contentWidth, "Packing (spacing x)");
-    ImGui::SliderFloat("##Packing (spacing x)", &spawn.spacingScale, 0.7f, 1.2f, "%.2f");
-}
 
 // Persistent-color patches (see SceneColorRegion): particles spawned inside keep the color all run.
 // Edited in the setup view like events: right-panel tab + drag gizmo (see DrawColorRegionsPanel).
@@ -446,7 +444,20 @@ static int              selectedRegion = -1;
 // True on frames where the "Persistent Color" window is the visible tab of the right dock node.
 static bool             colorsTabActive = false;
 
-static void DrawColorRegionFields(SceneColorRegion& r, float contentWidth) {
+// Solid obstacles (see SceneObstacle): same editing model as the color areas, in their own tab.
+static SceneObstacle    placeObstacleTemplate;
+static int              selectedObstacle = -1;
+static bool             obstaclesTabActive = false;
+
+// Particle groups (see SceneGroup): the spawn block(s), edited like obstacles in their own tab.
+static SceneGroup       placeGroupTemplate;
+static int              selectedGroup = -1;
+static bool             groupsTabActive = false;
+
+// Shared by SceneColorRegion, SceneObstacle and SceneGroup (identical shape fields; the first two
+// also share the color swatch, groups draw their own optional-color row).
+template <typename Shape>
+static void DrawColorRegionFields(Shape& r, float contentWidth, bool withColor = true) {
     static const char* ShapeNames[] = { "Circle", "Rect" };
     int shape = static_cast<int>(r.shape);
     FormRow(contentWidth, "Shape");
@@ -467,6 +478,7 @@ static void DrawColorRegionFields(SceneColorRegion& r, float contentWidth) {
         r.halfW = std::max(r.halfW, 0.f);
         r.halfH = std::max(r.halfH, 0.f);
     }
+    if (!withColor) return;
     const float swatchSize = ImGui::GetFrameHeight();
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Color");
@@ -487,20 +499,32 @@ static void DrawBoundarySection(SceneBoundary& b, float contentWidth) {
     ImGui::Checkbox("Periodic X", &b.periodicX);
 }
 
-static void DrawPhysicsSection(ScenePhysics& p, float contentWidth) {
+// ---- Physics tab sections, one per concern: what the fluid is, how it flows, what pushes on it,
+// how it meets walls, and how finely time is stepped. Each setting appears in exactly one of them.
+
+static void DrawExternalForceSection(ScenePhysics& p, float contentWidth) {
     FormRow(contentWidth, "Force (x, y)");
     ImGui::InputFloat2("##Force (x, y)", &p.force.x);
+    ImGui::TextDisabled("Uniform acceleration on every particle (e.g. gravity), px/s^2.");
+}
+
+static void DrawWallsSection(ScenePhysics& p, float contentWidth) {
     FormRow(contentWidth, "Restitution");
     ImGui::SliderFloat("##Restitution", &p.restitution, 0.f, 1.f, "%.2f");
     FormRow(contentWidth, "Friction");
     ImGui::SliderFloat("##Friction", &p.friction, 0.f, 1.f, "%.2f");
     ImGui::Checkbox("No-slip walls", &p.noSlipWalls);
+    ImGui::TextDisabled("Applies to the container and to obstacles.");
+}
+
+static void DrawIntegrationSection(ScenePhysics& p, float contentWidth) {
     FormRow(contentWidth, "Substeps");
     ImGui::InputInt("##Substeps", &p.substeps);
     p.substeps = std::max(p.substeps, 1);
     FormRow(contentWidth, "Force interval");
     ImGui::InputInt("##Force interval", &p.forceInterval);
     p.forceInterval = std::max(p.forceInterval, 1);
+    ImGui::TextDisabled("Substeps per frame; forces are recomputed every <interval> substeps.");
 }
 
 static const char* GravityMethodNames[] = { "Barnes-Hut", "Genuine 2D" };
@@ -534,19 +558,11 @@ static void DrawGravitySection(SceneGravity& g, float contentWidth) {
 static const char* EosModelNames[] = { "WCSPH", "Polytropic" };
 static const char* ViscosityModelNames[] = { "Monaghan (artificial)", "Morris (physical)" };
 
-static void DrawParticlesSection(SceneParticles& pr, float contentWidth) {
-    FormRow(contentWidth, "Circle radius");
-    ImGui::InputFloat("##Circle radius", &pr.circleRadius);
-
-    FormRow(contentWidth, "Smoothing radius");
-    ImGui::InputFloat("##Smoothing radius", &pr.smoothingRadius);
-    FormRow(contentWidth, "Target density");
-    ImGui::InputFloat("##Target density", &pr.targetDensity, 0.f, 0.f, "%.6f");
-    FormRow(contentWidth, "Stiffness");
-    ImGui::InputFloat("##Stiffness", &pr.stiffness);
-
+// The fluid itself: equation of state, its stiffness and rest density, and the SPH smoothing radius.
+// (Particle size and color live in the Scene tab; groups own the layout.)
+static void DrawFluidSection(SceneParticles& pr, float contentWidth) {
     int eosIdx = static_cast<int>(pr.eos);
-    FormRow(contentWidth, "EOS");
+    FormRow(contentWidth, "Equation of state");
     if (ImGui::Combo("##EOS", &eosIdx, EosModelNames, IM_ARRAYSIZE(EosModelNames)))
         pr.eos = static_cast<EosModel>(eosIdx);
     if (pr.eos == EosModel::WCSPH) {
@@ -556,9 +572,17 @@ static void DrawParticlesSection(SceneParticles& pr, float contentWidth) {
         FormRow(contentWidth, "Polytropic index");
         ImGui::InputFloat("##Polytropic index", &pr.polytropicIndex);
     }
+    FormRow(contentWidth, "Stiffness");
+    ImGui::InputFloat("##Stiffness", &pr.stiffness);
+    FormRow(contentWidth, "Target density");
+    ImGui::InputFloat("##Target density", &pr.targetDensity, 0.f, 0.f, "%.6f");
+    FormRow(contentWidth, "Smoothing radius");
+    ImGui::InputFloat("##Smoothing radius", &pr.smoothingRadius);
+}
 
+static void DrawViscositySection(SceneParticles& pr, float contentWidth) {
     int viscIdx = static_cast<int>(pr.viscosityModel);
-    FormRow(contentWidth, "Viscosity model");
+    FormRow(contentWidth, "Model");
     if (ImGui::Combo("##Viscosity model", &viscIdx, ViscosityModelNames, IM_ARRAYSIZE(ViscosityModelNames)))
         pr.viscosityModel = static_cast<ViscosityModel>(viscIdx);
     if (pr.viscosityModel == ViscosityModel::Monaghan) {
@@ -575,7 +599,7 @@ static void DrawParticlesSection(SceneParticles& pr, float contentWidth) {
 
 // Defined further down (needs ScreenHalfWidth/Height); forward-declared so AdvanceSimulation can
 // call it despite living earlier in the file, next to the other pause/step/menu logic.
-static void Integrate(float subDt);
+static bool Integrate(float subDt);
 
 // ---- Events (see SceneEvent) -------------------------------------------------------------------
 static bool       showEventAreas     = true;  // draw event gizmos over the live view (ImGui only, never recorded)
@@ -680,7 +704,69 @@ static float frozenHalfW = 0.f, frozenHalfH = 0.f;
 
 // `fullWindow`: measure against the whole window (recordings and batch renders, which are drawn
 // full-frame) instead of the free area between the docked panels (a plain live run).
+// ---- Sim thread ---------------------------------------------------------------------------------
+// Live (Running) physics runs on a worker thread so a slow, hung or diverging sim can never freeze
+// the window. The UI/render thread asks for time to be simulated; the worker advances it.
+//
+// simMutex guards all simulation state (objects, ActiveScene, eventFired, simTime, cameraOffsetX,
+// profileLogger sampling, the fault message). The worker holds it while it computes a substep and
+// releases it between substeps; the UI thread holds it while it draws the UI or reads particles,
+// and asks the worker to yield first (uiWaiting) so it waits at most one substep. If the lock can't
+// be taken in time the UI shows a "not responding" notice instead of touching sim state.
+// Rendering (batch) mode calls AdvanceSimulation straight from the main thread; the same lock keeps
+// it correct and is simply uncontended there.
+static std::timed_mutex          simMutex;
+static std::atomic<int>          uiWaiting{ 0 };
+static std::atomic<uint32_t>     simGeneration{ 0 }; // bumped by ResetSimulation; a step in flight abandons itself
+static std::atomic<bool>         simAbort{ false };  // set at shutdown so the worker stops at the next substep
+static std::atomic<bool>         simFaulted{ false };
+static std::string               simFaultMessage;    // guarded by simMutex
+
+static std::mutex                workMutex;
+static std::condition_variable   workCv;
+static double                    workPendingDt      = 0.0; // simulated seconds the UI thread wants advanced
+static int                       workManualSteps    = 0;   // StepDt-sized steps requested by Step / Step x10
+static bool                      workQuit           = false;
+static std::thread               simThread;
+static std::atomic<bool>         simThreadExited{ false };
+static std::atomic<float>        simStepMs{ 0.f }; // smoothed wall time of one worker step, for the live panel's "Compute"
+static std::atomic<float>        simSpeed{ 1.f };  // smoothed fraction of real time the sim keeps up with (1 = real time)
+static float                     renderCpuMs  = 0.f; // UI thread only: smoothed draw/submit time, excluding GPU/vsync/sim-lock waits
+static float                     lockWaitMs   = 0.f; // UI thread only: time LockSim waited this frame
+
+using SimLock = std::unique_lock<std::timed_mutex>;
+
+// Takes simMutex for the UI thread, making the worker yield. False if the worker is stuck inside a
+// single substep for longer than `timeoutMs` — the caller must then not touch any sim state.
+static bool LockSim(SimLock& lk, int timeoutMs = 100) {
+    const auto start = std::chrono::steady_clock::now();
+    uiWaiting++;
+    lk = SimLock(simMutex, std::defer_lock);
+    const bool ok = lk.try_lock_for(std::chrono::milliseconds(timeoutMs));
+    uiWaiting--;
+    lockWaitMs += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return ok;
+}
+
+// Marks the sim diverged and stops it advancing until the next reset. Caller holds simMutex.
+static void SetFaultLocked(const char* message) {
+    if (simFaulted) return;
+    simFaultMessage = message;
+    simFaulted      = true;
+    std::fprintf(stderr, "[sim] fault: %s\n", message);
+}
+
+static void ClearPendingWork() {
+    std::lock_guard<std::mutex> lk(workMutex);
+    workPendingDt   = 0.0;
+    workManualSteps = 0;
+}
+
 static void ResetSimulation(bool fullWindow) {
+    simGeneration++;
+    ClearPendingWork();
+    simFaulted = false;
+    simFaultMessage.clear();
     objects.clear();
     {
         const auto& b = ActiveScene.boundary;
@@ -703,20 +789,33 @@ static void ResetSimulation(bool fullWindow) {
 // Advances one substep loop's worth of physics by dt — factored out of the main loop so manual
 // stepping (paused, one keypress/button = one frame) runs the exact same code path as normal
 // per-frame advancement, just with a fixed dt instead of the frame's real one.
-static void AdvanceSimulation(float dt) {
-    const auto& physics = ActiveScene.physics;
+static void AdvanceSimulationLocked(float dt) {
+    SimLock lk(simMutex);
+    if (simFaulted) return;
+    const uint32_t generation = simGeneration;
     // Force is recomputed every forceInterval substeps (not once per frame, not every substep) —
     // see Integrate()'s comment for why a stale force is a real energy-gain source, and why
     // recomputing every substep was too expensive at this particle count.
-    const float subDt = dt / static_cast<float>(physics.substeps);
+    const int   substeps = std::max(ActiveScene.physics.substeps, 1);
+    const float subDt    = dt / static_cast<float>(substeps);
     ApplyOnceEvents();
-    for (int step = 0; step < physics.substeps; step++) {
-        if (step % physics.forceInterval == 0) {
+    for (int step = 0; step < substeps; step++) {
+        if (step > 0) {
+            // Between substeps the state is consistent: let the UI thread in if it's waiting.
+            lk.unlock();
+            while (uiWaiting.load() > 0 && !simAbort) std::this_thread::sleep_for(std::chrono::microseconds(50));
+            lk.lock();
+            if (simAbort || simFaulted || generation != simGeneration) return; // reset/aborted meanwhile
+        }
+        if (step % std::max(ActiveScene.physics.forceInterval, 1) == 0) {
             for (auto& obj : objects) obj.acc = Vec2(0.0f, 0.0f);
             Update(subDt);
         }
         ApplyContinuousEvents(simTime + static_cast<double>(step) * subDt, subDt);
-        Integrate(subDt);
+        if (!Integrate(subDt)) {
+            SetFaultLocked("Simulation diverged: a particle became non-finite or exceeded 1e6 px/s.");
+            return;
+        }
     }
 
     simTime += dt;
@@ -727,12 +826,91 @@ static void AdvanceSimulation(float dt) {
         profileLogger.Sample();
 }
 
+// Never lets an exception escape into the caller (the worker thread would otherwise terminate the
+// process): any failure becomes a fault the UI reports, and the sim just stops advancing.
+static void AdvanceSimulation(float dt) {
+    try {
+        AdvanceSimulationLocked(dt);
+    } catch (const std::exception& e) {
+        SimLock lk(simMutex);
+        SetFaultLocked(e.what());
+    } catch (...) {
+        SimLock lk(simMutex);
+        SetFaultLocked("Simulation failed with an unknown error.");
+    }
+}
+
+static void SimWorkerMain() {
+    for (;;) {
+        double dt     = 0.0;
+        int    manual = 0;
+        {
+            std::unique_lock<std::mutex> lk(workMutex);
+            workCv.wait(lk, [] { return workQuit || workPendingDt > 0.0 || workManualSteps > 0; });
+            if (workQuit) break;
+            if (workManualSteps > 0) { manual = workManualSteps; workManualSteps = 0; }
+            else                     { dt = workPendingDt;       workPendingDt   = 0.0; }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (manual > 0) {
+            for (int i = 0; i < manual && !simAbort && !simFaulted; i++) AdvanceSimulation(StepDt);
+        } else {
+            AdvanceSimulation(static_cast<float>(dt));
+        }
+        // Per call (not per manual step): a Step x10 burst reads as one long step, which is honest.
+        const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        simStepMs = simStepMs * 0.9f + ms * 0.1f;
+        // Simulated seconds covered per wall second, capped at real time: under 100% means the sim
+        // can't keep up and runs in slow motion. Manual steps aren't paced, so they don't count.
+        if (manual == 0 && ms > 0.f) {
+            const float speed = std::min(1.f, static_cast<float>(dt) / (ms * 0.001f));
+            simSpeed = simSpeed * 0.9f + speed * 0.1f;
+        }
+    }
+    simThreadExited = true;
+}
+
+static void StartSimThread() { simThread = std::thread(SimWorkerMain); }
+
+// Stops the worker. If it's wedged inside a single substep it can't be joined, so it's detached
+// and the caller must exit the process without running static destructors (returns false).
+static bool StopSimThread() {
+    simAbort = true;
+    {
+        std::lock_guard<std::mutex> lk(workMutex);
+        workQuit = true;
+    }
+    workCv.notify_all();
+    for (int i = 0; i < 200 && !simThreadExited; i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (simThreadExited) { simThread.join(); return true; }
+    simThread.detach();
+    return false;
+}
+
+// Asks the worker to simulate `dt` more seconds. Capped at one clamped frame, so a sim slower than
+// real time just runs in slow motion instead of building an ever-growing backlog.
+static void QueueSimTime(float dt) {
+    {
+        std::lock_guard<std::mutex> lk(workMutex);
+        workPendingDt = std::min(workPendingDt + static_cast<double>(dt), 1.0 / 30.0);
+    }
+    workCv.notify_one();
+}
+
+static void QueueManualSteps(int count) {
+    {
+        std::lock_guard<std::mutex> lk(workMutex);
+        workManualSteps += count;
+    }
+    workCv.notify_one();
+}
+
 static void TogglePause() { paused = !paused; }
 
 // Stepping always pauses first (if not already) — pressing Step/the arrow keys while running
 // freezes the sim on that frame rather than requiring a separate pause press first.
-static void StepOnce() { paused = true; AdvanceSimulation(StepDt); }
-static void StepBig()  { paused = true; for (int i = 0; i < BigStepFrames; i++) AdvanceSimulation(StepDt); }
+static void StepOnce() { paused = true; QueueManualSteps(1); }
+static void StepBig()  { paused = true; QueueManualSteps(BigStepFrames); }
 
 // The recording/data-save configuration currently driving Running/Rendering — set by StartRun so
 // AdvanceRendering's frame rate and DrawRenderingOverlay's progress display reflect whichever
@@ -776,10 +954,18 @@ static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch
 
     // Shared by both outputs below, so a run's video and CSV carry the same run number and are
     // recognizable as belonging to the same run at a glance.
+    //
+    // This generated name is the only default there is: a title (required in the UI, see
+    // RequireTitles) is appended to it, and a blank or unsanitizable one — however it got past the
+    // UI check — just leaves the generated name as is. The particle count is the spawned one
+    // (after obstacle culling), since ResetSimulation has just run.
+    auto withTitle = [](std::string name, const char* title) {
+        const std::string clean = SanitizeFilename(title, "");
+        return clean.empty() ? name : name + "_" + clean;
+    };
     const std::string runBase = RunNaming::BuildBaseName({
         .sceneName      = scene.name,
-        .gridCountX     = scene.spawn.gridCountX,
-        .gridCountY     = scene.spawn.gridCountY,
+        .particleCount  = static_cast<int>(objects.size()),
         .gravityEnabled = scene.gravity.enabled,
         .gravityG       = scene.gravity.g,
         .stiffness      = scene.particles.stiffness,
@@ -790,11 +976,9 @@ static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch
     bool dataStarted = false;
 
     if (run.record) {
-        std::string name = runBase;
-        if (std::strlen(run.title) > 0) name += "_" + SanitizeFilename(run.title, "");
         // Sanitized here too (StartRecording does it again, idempotently) so the existence check
         // below looks at the exact path that will be written, e.g. when %g put a '+' in the name.
-        name = SanitizeFilename(name, "capture");
+        std::string name = SanitizeFilename(withTitle(runBase, run.title), runBase.c_str());
         name = RunNaming::EnsureUniqueBaseName(name, { { ExecutableDir() / "recordings", ".mp4" } });
         recording = app.StartRecording(name, run.fps, run.lengthSeconds);
     }
@@ -810,8 +994,7 @@ static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch
         const auto  dir = ExecutableDir() / "data";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
-        std::string name = runBase;
-        if (std::strlen(run.dataTitle) > 0) name += "_" + SanitizeFilename(run.dataTitle, "");
+        std::string name = withTitle(runBase, run.dataTitle);
         name = RunNaming::EnsureUniqueBaseName(name, { { dir, ".csv" } });
         if (!ec && dataRecorder.Start((dir / (name + ".csv")).string(), fields)) {
             dataStarted      = true;
@@ -836,8 +1019,7 @@ static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch
             std::snprintf(tag, sizeof(tag), "_Morris_nu%g", p.kinematicViscosity);
         else
             std::snprintf(tag, sizeof(tag), "_Monaghan_a%g_b%g", p.viscosity, p.viscosityQuadratic);
-        std::string name = runBase + tag;
-        if (std::strlen(run.profileTitle) > 0) name += "_" + SanitizeFilename(run.profileTitle, "");
+        std::string name = withTitle(runBase + tag, run.profileTitle);
         name = RunNaming::EnsureUniqueBaseName(name, { { dir, "_profile.csv" } });
         if (!ec)
             profileStarted = profileLogger.Start(dir / name, run.profileRate,
@@ -944,6 +1126,23 @@ static void EndCard() {
 
 // ---- Setup tabs (Menu state) ----------------------------------------------------------------
 
+// Container half-extents as the setup view shows them (same rule as the preview in DrawSimOverlay).
+static void MenuHalfExtents(const Scene& s, float& halfW, float& halfH) {
+    halfW = s.boundary.halfWidthPx  > 0.f ? s.boundary.halfWidthPx  : app.RecordingHalfWidth()  * s.boundary.widthFrac;
+    halfH = s.boundary.halfHeightPx > 0.f ? s.boundary.halfHeightPx : app.RecordingHalfHeight() * s.boundary.heightFrac;
+}
+
+// Seeds the scene's editable particle groups from its legacy spawn block (grid counts, circular,
+// offset, packing), so a built-in or older preset shows up as one group that can be moved, resized
+// or deleted. Called when a scene is loaded and whenever one of those block controls is edited
+// (which therefore regenerates the groups).
+static void SyncGroupsFromSpawn(Scene& s) {
+    float halfW, halfH;
+    MenuHalfExtents(s, halfW, halfH);
+    s.groups    = { SpawnBlockAsGroup(s, halfW, halfH) };
+    s.useGroups = true;
+}
+
 // Which scene index menuConfig.scene was last seeded from (-1 = never), so a scene change is told
 // apart from ordinary frames; also re-pointed by "Save Current as Preset" so saving doesn't reseed.
 static int lastSyncedSceneIndex = -1;
@@ -967,25 +1166,11 @@ static void DrawSceneTab() {
         ImGui::EndCombo();
     }
     ImGui::TextUnformatted(CombinedDescription(menuConfig.sceneIndex).c_str());
-    if (!CombinedIsBuiltin(menuConfig.sceneIndex))
-        ImGui::TextDisabled("Custom preset: resizing the grid below won't re-tune its physics constants.");
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Particles");
-    int gridX = menuConfig.scene.spawn.gridCountX;
-    int gridY = menuConfig.scene.spawn.gridCountY;
-    FormRow(w, "Grid X");
-    const bool gridXEdited = ImGui::InputInt("##Grid X", &gridX);
-    FormRow(w, "Grid Y");
-    const bool gridYEdited = ImGui::InputInt("##Grid Y", &gridY);
-    gridX = std::max(gridX, 1);
-    gridY = std::max(gridY, 1);
 
     // Reseeds menuConfig.scene from scratch (the preset factory, or the preset file) whenever the
-    // scene selection or the grid count actually changes this frame — including the very first
-    // DrawMenu call, since lastSyncedSceneIndex starts at a value no real sceneIndex can equal.
-    // Every other field is left exactly as the user last edited it on every other frame; see the
-    // CollapsingHeader sections below.
+    // scene selection changes this frame — including the very first DrawMenu call, since
+    // lastSyncedSceneIndex starts at a value no real sceneIndex can equal. Every other field is
+    // left exactly as the user last edited it on every other frame; see the sections below.
     if (menuConfig.sceneIndex != lastSyncedSceneIndex) {
         bool loadedOk = true;
         if (CombinedIsBuiltin(menuConfig.sceneIndex)) {
@@ -1000,53 +1185,45 @@ static void DrawSceneTab() {
         }
         if (loadedOk) {
             lastSyncedSceneIndex = menuConfig.sceneIndex;
+            if (!menuConfig.scene.useGroups) SyncGroupsFromSpawn(menuConfig.scene);
         } else {
             // The preset file is gone/unreadable: fall back to the first built-in and rescan so
             // the combo and the scene fields agree again instead of showing the dead selection.
             RefreshUserPresets();
             menuConfig.sceneIndex = 0;
             menuConfig.scene = BuildScene(0, ScenePresets[0].spawn.gridCountX, ScenePresets[0].spawn.gridCountY);
+            SyncGroupsFromSpawn(menuConfig.scene);
             lastSyncedSceneIndex = 0;
         }
-    } else if (gridXEdited || gridYEdited) {
-        // Only the fields that actually depend on the grid count are updated, so hand edits to
-        // everything else (stiffness, gravity, boundary, name, ...) survive a grid resize. For a
-        // built-in, "depends on the grid count" is found by diffing the factory scene at the old
-        // count against the one at the new count; a user preset has no recalibration formula, so
-        // only the count itself changes.
-        Scene& cur = menuConfig.scene;
-        if (CombinedIsBuiltin(menuConfig.sceneIndex)) {
-            const Scene oldDefault = BuildScene(menuConfig.sceneIndex, cur.spawn.gridCountX, cur.spawn.gridCountY);
-            const Scene newDefault = BuildScene(menuConfig.sceneIndex, gridX, gridY);
-            auto follow = [](auto& dst, const auto& oldV, const auto& newV) { if (oldV != newV) dst = newV; };
-            follow(cur.boundary.halfWidthPx,       oldDefault.boundary.halfWidthPx,       newDefault.boundary.halfWidthPx);
-            follow(cur.boundary.halfHeightPx,      oldDefault.boundary.halfHeightPx,      newDefault.boundary.halfHeightPx);
-            follow(cur.physics.force.x,            oldDefault.physics.force.x,            newDefault.physics.force.x);
-            follow(cur.physics.force.y,            oldDefault.physics.force.y,            newDefault.physics.force.y);
-            follow(cur.physics.substeps,           oldDefault.physics.substeps,           newDefault.physics.substeps);
-            follow(cur.gravity.particleMass,       oldDefault.gravity.particleMass,       newDefault.gravity.particleMass);
-            follow(cur.gravity.softening,          oldDefault.gravity.softening,          newDefault.gravity.softening);
-            follow(cur.particles.circleRadius,     oldDefault.particles.circleRadius,     newDefault.particles.circleRadius);
-            follow(cur.particles.smoothingRadius,  oldDefault.particles.smoothingRadius,  newDefault.particles.smoothingRadius);
-            follow(cur.particles.targetDensity,    oldDefault.particles.targetDensity,    newDefault.particles.targetDensity);
-            follow(cur.particles.stiffness,        oldDefault.particles.stiffness,        newDefault.particles.stiffness);
-        }
-        cur.spawn.gridCountX = gridX;
-        cur.spawn.gridCountY = gridY;
     }
 
-    ImGui::Checkbox("Circular spawn", &menuConfig.scene.spawn.circular);
-    ImGui::TextDisabled("%d particles", menuConfig.scene.spawn.gridCountX * menuConfig.scene.spawn.gridCountY);
-    ImGui::TextDisabled("Real-Time Limit: %d particles",
+    ImGui::TextDisabled("%d particles  |  real-time limit %d", SceneParticleCount(menuConfig.scene),
                          menuConfig.scene.realTimeLimitX * menuConfig.scene.realTimeLimitY);
-
-
+    ImGui::TextDisabled("Particle blocks are placed in the Groups tab of the right panel.");
     EndCard();
     }
 
-    Widgets::Caption("LAYOUT");
-    if (ImGui::CollapsingHeader("Spawn"))    DrawSpawnSection(menuConfig.scene.spawn, w);
-    if (ImGui::CollapsingHeader("Boundary")) DrawBoundarySection(menuConfig.scene.boundary, w);
+    // Particle size and base color live here only: the size sets every group's lattice spacing (with
+    // its own packing), so it must not be editable from a second place.
+    Widgets::Caption("PARTICLES");
+    BeginCard("##particleCard");
+    {
+        auto& pr = menuConfig.scene.particles;
+        const float cw = ImGui::GetContentRegionAvail().x;
+        FormRow(cw, "Particle radius (px)");
+        ImGui::InputFloat("##Circle radius", &pr.circleRadius);
+        pr.circleRadius = std::max(pr.circleRadius, 0.5f);
+        const float swatchSize = ImGui::GetFrameHeight();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Particle color");
+        ImGui::SameLine(cw - swatchSize);
+        ImGui::ColorEdit4("##circlecolor", &pr.circleColor.r, ImGuiColorEditFlags_NoInputs);
+        ImGui::TextDisabled("Groups can override the color; color areas and patterns paint over it.");
+    }
+    EndCard();
+
+    Widgets::Caption("CONTAINER");
+    if (ImGui::CollapsingHeader("Boundary", ImGuiTreeNodeFlags_DefaultOpen)) DrawBoundarySection(menuConfig.scene.boundary, w);
 
     if (ImGui::CollapsingHeader("Presets")) {
         static char presetSaveName[128] = "";
@@ -1102,22 +1279,78 @@ static void DrawSceneTab() {
 static void DrawPhysicsTab() {
     const float w = ImGui::GetContentRegionAvail().x;
     ImGui::PushTextWrapPos(0.f);
-    if (ImGui::CollapsingHeader("Physics", ImGuiTreeNodeFlags_DefaultOpen))         DrawPhysicsSection(menuConfig.scene.physics, w);
-    if (ImGui::CollapsingHeader("Gravity"))                                         DrawGravitySection(menuConfig.scene.gravity, w);
-    if (ImGui::CollapsingHeader("Particles / EOS", ImGuiTreeNodeFlags_DefaultOpen)) DrawParticlesSection(menuConfig.scene.particles, w);
-    // Always available (not tied to recording) so velocity/density gradient coloring can be set up
-    // before a run starts, including for batch renders that never visit the live view.
-    if (ImGui::CollapsingHeader("Color By"))                                        DrawColorByControls(w);
+    Scene& s = menuConfig.scene;
+    Widgets::Caption("FLUID");
+    if (ImGui::CollapsingHeader("Equation of state", ImGuiTreeNodeFlags_DefaultOpen)) DrawFluidSection(s.particles, w);
+    if (ImGui::CollapsingHeader("Viscosity", ImGuiTreeNodeFlags_DefaultOpen))         DrawViscositySection(s.particles, w);
+
+    Widgets::Caption("FORCES");
+    if (ImGui::CollapsingHeader("External force", ImGuiTreeNodeFlags_DefaultOpen))    DrawExternalForceSection(s.physics, w);
+    if (ImGui::CollapsingHeader("Self-gravity"))                                      DrawGravitySection(s.gravity, w);
+
+    Widgets::Caption("BOUNDARIES");
+    if (ImGui::CollapsingHeader("Walls and obstacles", ImGuiTreeNodeFlags_DefaultOpen)) DrawWallsSection(s.physics, w);
+
+    Widgets::Caption("SOLVER");
+    if (ImGui::CollapsingHeader("Time stepping", ImGuiTreeNodeFlags_DefaultOpen))     DrawIntegrationSection(s.physics, w);
     ImGui::PopTextWrapPos();
 }
 
+// Every enabled output (video, CSV data, velocity profile) must be given a title, which becomes
+// part of its file name. Starting (or queueing) a run without one jumps to the Output tab and marks
+// the empty fields instead of going ahead.
+static bool TitleBlank(const char* s) {
+    for (; *s; ++s)
+        if (!std::isspace(static_cast<unsigned char>(*s))) return false;
+    return true;
+}
+static bool MissingTitles(const RunSettings& r) {
+    return (r.record && TitleBlank(r.title)) || (r.saveData && TitleBlank(r.dataTitle)) ||
+           (r.saveProfile && TitleBlank(r.profileTitle));
+}
+
+static bool showTitleErrors = false; // mark empty required titles (after a refused Start)
+static int  requestedTab    = -1;    // setup tab to switch to on the next frame (index into DrawSetupPanel's tabs)
+constexpr int OutputTabIndex = 2;
+
+static bool RequireTitles(const RunSettings& r) {
+    showTitleErrors = MissingTitles(r);
+    if (showTitleErrors) requestedTab = OutputTabIndex;
+    return !showTitleErrors;
+}
+
+static void DrawTitleInput(float w, const char* label, const char* id, char* buf, size_t size) {
+    FormRow(w, label);
+    const bool bad = showTitleErrors && TitleBlank(buf);
+    if (bad) {
+        ImGui::PushStyleColor(ImGuiCol_Border, Theme::Coral);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f);
+    }
+    ImGui::InputText(id, buf, size);
+    if (bad) {
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        ImGui::TextColored(Theme::Coral, "A title is required.");
+    }
+}
+
+static void DrawQueueSection();
+
+// Everything about a run's output in one place: how particles are colored, what gets saved, and the
+// queue of runs built from those settings.
 static void DrawOutputTab() {
     const float w = ImGui::GetContentRegionAvail().x;
     ImGui::PushTextWrapPos(0.f);
+
+    // Always available (not tied to recording) so velocity/density gradient coloring can be set up
+    // before a run starts, including for batch renders that never visit the live view.
+    Widgets::Caption("APPEARANCE");
+    if (ImGui::CollapsingHeader("Color by")) DrawColorByControls(w);
+
+    Widgets::Caption("SAVE");
     ImGui::Checkbox("Record to video", &menuConfig.run.record);
     if (menuConfig.run.record) {
-        FormRow(w, "Title (optional label)");
-        ImGui::InputText("##Title (optional label)", menuConfig.run.title, sizeof(menuConfig.run.title));
+        DrawTitleInput(w, "Title", "##Title", menuConfig.run.title, sizeof(menuConfig.run.title));
         FormRow(w, "FPS");
         ImGui::InputInt("##FPS", &menuConfig.run.fps);
         menuConfig.run.fps = std::clamp(menuConfig.run.fps, 1, 240);
@@ -1136,8 +1369,7 @@ static void DrawOutputTab() {
     ImGui::Separator();
     ImGui::Checkbox("Save data to CSV", &menuConfig.run.saveData);
     if (menuConfig.run.saveData) {
-        FormRow(w, "Data title (optional label)");
-        ImGui::InputText("##Data title (optional label)", menuConfig.run.dataTitle, sizeof(menuConfig.run.dataTitle));
+        DrawTitleInput(w, "Data title", "##Data title", menuConfig.run.dataTitle, sizeof(menuConfig.run.dataTitle));
         FormRow(w, "Sample rate (Hz)");
         ImGui::InputInt("##Sample rate (Hz)", &menuConfig.run.dataRate);
         menuConfig.run.dataRate = std::clamp(menuConfig.run.dataRate, 1, 240);
@@ -1161,8 +1393,7 @@ static void DrawOutputTab() {
     ImGui::Separator();
     ImGui::Checkbox("Save channel velocity profile", &menuConfig.run.saveProfile);
     if (menuConfig.run.saveProfile) {
-        FormRow(w, "Profile title (optional label)");
-        ImGui::InputText("##Profile title (optional label)", menuConfig.run.profileTitle, sizeof(menuConfig.run.profileTitle));
+        DrawTitleInput(w, "Profile title", "##Profile title", menuConfig.run.profileTitle, sizeof(menuConfig.run.profileTitle));
         FormRow(w, "Profile rate (Hz, sim time)");
         ImGui::InputInt("##Profile rate (Hz, sim time)", &menuConfig.run.profileRate);
         menuConfig.run.profileRate = std::clamp(menuConfig.run.profileRate, 1, 60);
@@ -1176,16 +1407,18 @@ static void DrawOutputTab() {
                              "channel height, plus per-sample density/velocity stats.");
     }
 
+    ImGui::Spacing();
+    Widgets::Caption("RUN QUEUE");
+    DrawQueueSection();
 
     ImGui::PopTextWrapPos();
 }
 
-static void DrawQueueTab() {
+static void DrawQueueSection() {
     const float w = ImGui::GetContentRegionAvail().x;
     ImGui::PushTextWrapPos(0.f);
-    ImGui::TextUnformatted("Run Queue");
     if (ImGui::Button("Add to Queue", ImVec2(w, 0.f))) {
-        if (HasDeterministicEnd(menuConfig.run))
+        if (HasDeterministicEnd(menuConfig.run) && RequireTitles(menuConfig.run))
             runQueue.push_back({ menuConfig.scene, menuConfig.run });
     }
     if (!HasDeterministicEnd(menuConfig.run))
@@ -1197,8 +1430,8 @@ static void DrawQueueTab() {
         ImGui::PushID(i);
         ImGui::TextDisabled("%d.", i + 1);
         ImGui::SameLine();
-        ImGui::Text("%s (%dx%d)%s%s%s", runQueue[i].scene.name.c_str(),
-                    runQueue[i].scene.spawn.gridCountX, runQueue[i].scene.spawn.gridCountY,
+        ImGui::Text("%s (%d particles)%s%s%s", runQueue[i].scene.name.c_str(),
+                    SceneParticleCount(runQueue[i].scene),
                     runQueue[i].run.record      ? " [video]"   : "",
                     runQueue[i].run.saveData    ? " [data]"    : "",
                     runQueue[i].run.saveProfile ? " [profile]" : "");
@@ -1222,12 +1455,19 @@ static void DrawSetupPanel() {
     const float buttonH = ImGui::GetFrameHeight() * 1.5f;
     const float footerH = buttonH + ImGui::GetTextLineHeight() + style.ItemSpacing.y * 3.f;
 
+    // Errors clear themselves once every required title has been filled in, so enabling another
+    // output later doesn't start out marked red.
+    if (showTitleErrors && !MissingTitles(menuConfig.run)) showTitleErrors = false;
+
     if (ImGui::BeginTabBar("##setupTabs")) {
         struct Tab { const char* name; void (*draw)(); };
         const Tab tabs[] = { { "Scene", DrawSceneTab }, { "Physics", DrawPhysicsTab },
-                             { "Output", DrawOutputTab }, { "Queue", DrawQueueTab } };
+                             { "Output", DrawOutputTab } };
         for (const Tab& t : tabs) {
-            if (!ImGui::BeginTabItem(t.name)) continue;
+            const int index = static_cast<int>(&t - tabs);
+            // A refused Start asks for the Output tab: SetSelected on the frame it's requested.
+            const ImGuiTabItemFlags flags = index == requestedTab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+            if (!ImGui::BeginTabItem(t.name, nullptr, flags)) continue;
             ImGui::BeginChild("##tabScroll", ImVec2(0.f, -footerH));
             ImGui::Spacing();
             t.draw();
@@ -1236,12 +1476,13 @@ static void DrawSetupPanel() {
         }
         ImGui::EndTabBar();
     }
+    requestedTab = -1;
 
     ImGui::Separator();
-    const int count = menuConfig.scene.spawn.gridCountX * menuConfig.scene.spawn.gridCountY;
+    const int count = SceneParticleCount(menuConfig.scene);
     ImGui::TextDisabled("%d particles  |  real-time limit %d", count,
                          menuConfig.scene.realTimeLimitX * menuConfig.scene.realTimeLimitY);
-    if (Widgets::PrimaryButton("Start Simulation", ImVec2(-FLT_MIN, buttonH)))
+    if (Widgets::PrimaryButton("Start Simulation", ImVec2(-FLT_MIN, buttonH)) && RequireTitles(menuConfig.run))
         StartSimulationFromMenu();
 }
 
@@ -1252,9 +1493,51 @@ static void DrawLivePanel() {
 
     Widgets::Caption("RUN");
     BeginCard("##runCard");
-    ImGui::Text("Simulated time   %.2f s", simTime);
-    ImGui::Text("Particles        %d", static_cast<int>(objects.size()));
+    // Label on the left, value right-aligned to the card's edge so the numbers line up.
+    auto statRow = [](const char* label, const char* value, const ImVec4* color = nullptr) {
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine();
+        const float valueW = ImGui::CalcTextSize(value).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(ImGui::GetContentRegionAvail().x - valueW, 0.f));
+        if (color) ImGui::TextColored(*color, "%s", value);
+        else       ImGui::TextUnformatted(value);
+    };
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%.2f s", simTime);
+    statRow("Simulated time", buf);
+    std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(objects.size()));
+    statRow("Particles", buf);
+    // The sim and the renderer run side by side, so these don't add up: Frame is the length of one
+    // frame (vsync-limited), Compute is how long the sim thread takes per step, Render is the UI
+    // thread's own drawing work with the GPU/vsync waits taken out, and Sim speed is how much of
+    // real time the sim keeps up with (under 100% = slow motion).
+    const Profiler::Stats& perf = profiler.GetStats();
+    std::snprintf(buf, sizeof(buf), "%.0f", perf.fps);
+    statRow("FPS", buf);
+    std::snprintf(buf, sizeof(buf), "%.2f ms", perf.frameMs);
+    statRow("Frame", buf);
+    std::snprintf(buf, sizeof(buf), "%.2f ms", simStepMs.load());
+    statRow("Compute", buf);
+    std::snprintf(buf, sizeof(buf), "%.2f ms", renderCpuMs);
+    statRow("Render (CPU)", buf);
+    const float speed = simSpeed.load();
+    if (paused) {
+        statRow("Sim speed", "paused");
+    } else {
+        std::snprintf(buf, sizeof(buf), "%.0f%%", speed * 100.f);
+        const ImVec4 speedColor = speed < 0.97f ? Theme::Coral : Theme::Teal;
+        statRow("Sim speed", buf, &speedColor);
+    }
     ImGui::TextDisabled("Space: pause  |  Right: step  |  Left: step x10");
+    if (simFaulted) {
+        ImGui::Spacing();
+        // TextWrapped wraps at the card's own content edge; the outer PushTextWrapPos(0) in this
+        // panel wraps at the parent window's edge, which lies past the card and clipped the text.
+        ImGui::PushStyleColor(ImGuiCol_Text, Theme::Coral);
+        ImGui::TextWrapped("%s", simFaultMessage.c_str());
+        ImGui::PopStyleColor();
+        ImGui::TextDisabled("Stepping is stopped. Press Restart to reset the sim.");
+    }
     EndCard();
 
     Widgets::Caption("VIEW");
@@ -1436,15 +1719,8 @@ static void DrawColorPatternSection(SceneColorPattern& p, float w) {
 static void DrawColorRegionsPanel() {
     {
         const float pw = ImGui::GetContentRegionAvail().x;
-        // Base color for particles no pattern/area recolors. Label on the left, swatch pinned to the right
-        // edge (a full ColorEdit4 is too wide for a trailing label).
-        Widgets::Caption("BASE COLOR");
-        const float swatchSize = ImGui::GetFrameHeight();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Particle color");
-        ImGui::SameLine(pw - swatchSize);
-        ImGui::ColorEdit4("##circlecolor", &menuConfig.scene.particles.circleColor.r, ImGuiColorEditFlags_NoInputs);
-        ImGui::Spacing();
+        // The base particle color is set in the Scene tab (and per group in the Groups tab); this
+        // panel only paints over it.
         Widgets::Caption("PATTERN");
         DrawColorPatternSection(menuConfig.scene.colorPattern, pw);
         ImGui::Spacing();
@@ -1545,6 +1821,196 @@ static void DrawColorsWindow() {
     ImGui::End();
 }
 
+// Setup-only list of solid obstacles (see SceneObstacle).
+static void DrawObstaclesPanel() {
+    auto& obstacles = menuConfig.scene.obstacles;
+    if (selectedObstacle >= static_cast<int>(obstacles.size())) selectedObstacle = -1;
+    const float w = ImGui::GetContentRegionAvail().x;
+
+    ImGui::TextDisabled("Drag in the view to draw an obstacle. Drag it to move, its handles to resize\n"
+                         "(hold Alt to resize from the center). Del removes the selected one. No\n"
+                         "particles spawn inside, and the fluid can't enter it during the run. Keep\n"
+                         "obstacles off the seam of a periodic-X scene.");
+    ImGui::Spacing();
+
+    if (Widgets::PrimaryButton("+ New obstacle at center", ImVec2(w, 0.f))) {
+        SceneObstacle o = placeObstacleTemplate;
+        o.cx = 0.f; o.cy = 0.f;
+        obstacles.push_back(o);
+        selectedObstacle = static_cast<int>(obstacles.size()) - 1;
+    }
+
+    if (ImGui::CollapsingHeader("New obstacle defaults")) {
+        static const char* ShapeNames[] = { "Circle", "Rect" };
+        int shape = static_cast<int>(placeObstacleTemplate.shape);
+        FormRow(w, "Shape");
+        if (ImGui::Combo("##defObstacleShape", &shape, ShapeNames, 2)) placeObstacleTemplate.shape = static_cast<EventShape>(shape);
+        const float swatchSize = ImGui::GetFrameHeight();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Color");
+        ImGui::SameLine(w - swatchSize);
+        ImGui::ColorEdit4("##defObstacleColor", &placeObstacleTemplate.color.r, ImGuiColorEditFlags_NoInputs);
+    }
+
+    Widgets::Caption("OBSTACLES");
+    if (obstacles.empty()) ImGui::TextDisabled("None yet.");
+    for (int i = 0; i < static_cast<int>(obstacles.size()); i++) {
+        const SceneObstacle& o = obstacles[i];
+        ImGui::PushID(i);
+        char label[96];
+        std::snprintf(label, sizeof(label), "      %d   %s", i + 1, o.shape == EventShape::Circle ? "Circle" : "Rect");
+        const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+        if (ImGui::Selectable(label, i == selectedObstacle)) selectedObstacle = i;
+        ImGui::GetWindowDrawList()->AddCircleFilled(
+            ImVec2(rowPos.x + ImGui::GetFontSize() * 0.7f, rowPos.y + ImGui::GetFrameHeight() * 0.5f - 2.f),
+            ImGui::GetFontSize() * 0.28f, ImGui::ColorConvertFloat4ToU32(ImVec4(o.color.r, o.color.g, o.color.b, 1.f)));
+        ImGui::PopID();
+    }
+
+    if (selectedObstacle >= 0) {
+        SceneObstacle& o = obstacles[selectedObstacle];
+        char title[32];
+        std::snprintf(title, sizeof(title), "OBSTACLE %d", selectedObstacle + 1);
+        Widgets::Caption(title);
+        BeginCard("##obstacleInspector");
+        DrawColorRegionFields(o, ImGui::GetContentRegionAvail().x);
+        ImGui::Spacing();
+        const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.f;
+        if (ImGui::Button("Duplicate", ImVec2(bw, 0.f))) {
+            SceneObstacle copy = o;
+            copy.cx += 30.f; copy.cy -= 30.f;
+            obstacles.push_back(copy);
+            selectedObstacle = static_cast<int>(obstacles.size()) - 1;
+        } else {
+            ImGui::SameLine();
+            if (Widgets::DangerButton("Delete", ImVec2(bw, 0.f))) {
+                obstacles.erase(obstacles.begin() + selectedObstacle);
+                selectedObstacle = -1;
+            }
+        }
+        EndCard();
+    }
+}
+
+// Setup-only list of particle groups (see SceneGroup). Deleting them all gives an empty scene.
+static void DrawGroupsPanel() {
+    auto& groups = menuConfig.scene.groups;
+    if (selectedGroup >= static_cast<int>(groups.size())) selectedGroup = -1;
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float circleR = menuConfig.scene.particles.circleRadius;
+
+    ImGui::TextDisabled("Each group is a block of starting particles. Drag in the view to draw one,\n"
+                         "drag it to move it, its handles to resize it (hold Alt to resize from the\n"
+                         "center). Del removes the selected group; with none left the scene starts\n"
+                         "empty. Particle size is set in the Scene tab.");
+    ImGui::Spacing();
+
+    if (Widgets::PrimaryButton("+ New group at center", ImVec2(w, 0.f))) {
+        SceneGroup g = placeGroupTemplate;
+        g.cx = 0.f; g.cy = 0.f;
+        groups.push_back(g);
+        selectedGroup = static_cast<int>(groups.size()) - 1;
+    }
+
+    if (ImGui::CollapsingHeader("New group defaults")) {
+        static const char* ShapeNames[] = { "Circle", "Rect" };
+        int shape = static_cast<int>(placeGroupTemplate.shape);
+        FormRow(w, "Shape");
+        if (ImGui::Combo("##defGroupShape", &shape, ShapeNames, 2)) placeGroupTemplate.shape = static_cast<EventShape>(shape);
+        FormRow(w, "Packing (spacing x)");
+        ImGui::SliderFloat("##defGroupSpacing", &placeGroupTemplate.spacingScale, 0.5f, 2.0f, "%.2f");
+    }
+
+    Widgets::Caption("GROUPS");
+    if (groups.empty()) ImGui::TextDisabled("None - the scene starts empty.");
+    for (int i = 0; i < static_cast<int>(groups.size()); i++) {
+        const SceneGroup& g = groups[i];
+        const Color c = g.customColor ? g.color : menuConfig.scene.particles.circleColor;
+        ImGui::PushID(i);
+        char label[96];
+        std::snprintf(label, sizeof(label), "      %d   %s   %d", i + 1, g.shape == EventShape::Circle ? "Circle" : "Rect",
+                      GroupParticleCount(g, GroupSpacing(g, circleR)));
+        const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+        if (ImGui::Selectable(label, i == selectedGroup)) selectedGroup = i;
+        ImGui::GetWindowDrawList()->AddCircleFilled(
+            ImVec2(rowPos.x + ImGui::GetFontSize() * 0.7f, rowPos.y + ImGui::GetFrameHeight() * 0.5f - 2.f),
+            ImGui::GetFontSize() * 0.28f, ImGui::ColorConvertFloat4ToU32(ImVec4(c.r, c.g, c.b, 1.f)));
+        ImGui::PopID();
+    }
+
+    if (selectedGroup >= 0) {
+        SceneGroup& g = groups[selectedGroup];
+        char title[32];
+        std::snprintf(title, sizeof(title), "GROUP %d", selectedGroup + 1);
+        Widgets::Caption(title);
+        BeginCard("##groupInspector");
+        const float cw = ImGui::GetContentRegionAvail().x;
+        DrawColorRegionFields(g, cw, /*withColor=*/false);
+        FormRow(cw, "Packing (spacing x)");
+        ImGui::SliderFloat("##groupSpacing", &g.spacingScale, 0.5f, 2.0f, "%.2f");
+        const float spacing = GroupSpacing(g, circleR);
+        // Editing the count resizes the block at the current spacing (the view updates live).
+        int count = GroupParticleCount(g, spacing);
+        FormRow(cw, "Particle count");
+        if (ImGui::InputInt("##groupCount", &count, 0, 0))
+            ResizeGroupToCount(g, spacing, count);
+        ImGui::TextDisabled("spacing %.1f px  |  particle radius %.1f px", spacing, circleR);
+        ImGui::Checkbox("Own color", &g.customColor);
+        if (g.customColor) {
+            const float swatchSize = ImGui::GetFrameHeight();
+            ImGui::SameLine(cw - swatchSize);
+            ImGui::ColorEdit4("##groupColor", &g.color.r, ImGuiColorEditFlags_NoInputs);
+        } else {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(scene particle color)");
+        }
+        ImGui::Spacing();
+        const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.f;
+        if (ImGui::Button("Duplicate", ImVec2(bw, 0.f))) {
+            SceneGroup copy = g;
+            copy.cx += 30.f; copy.cy -= 30.f;
+            groups.push_back(copy);
+            selectedGroup = static_cast<int>(groups.size()) - 1;
+        } else {
+            ImGui::SameLine();
+            if (Widgets::DangerButton("Delete", ImVec2(bw, 0.f))) {
+                groups.erase(groups.begin() + selectedGroup);
+                selectedGroup = -1;
+            }
+        }
+        EndCard();
+    }
+}
+
+static void DrawGroupsWindow() {
+    groupsTabActive = false;
+    if (appState != AppState::Menu) return;
+    if (const ImGuiWindow* rw = ImGui::FindWindowByName(Workspace::RightPanelId); rw && rw->DockId)
+        ImGui::SetNextWindowDockID(rw->DockId, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Groups###GroupsPanel")) {
+        groupsTabActive = true;
+        ImGui::PushTextWrapPos(0.f);
+        DrawGroupsPanel();
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::End();
+}
+
+// Own window, docked as a tab beside "Events" and "Persistent Color" on first appearance.
+static void DrawObstaclesWindow() {
+    obstaclesTabActive = false;
+    if (appState != AppState::Menu) return;
+    if (const ImGuiWindow* rw = ImGui::FindWindowByName(Workspace::RightPanelId); rw && rw->DockId)
+        ImGui::SetNextWindowDockID(rw->DockId, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Obstacles###ObstaclesPanel")) {
+        obstaclesTabActive = true;
+        ImGui::PushTextWrapPos(0.f);
+        DrawObstaclesPanel();
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::End();
+}
+
 static void DrawEventsPanel() {
     if (ImGui::Begin("Events###RightPanel")) {
         const bool locked = appState == AppState::Rendering;
@@ -1627,6 +2093,176 @@ static void DrawEventsPanel() {
 
 // ---- Sim view: scene preview (setup) + event gizmos -----------------------------------------
 
+// Draws/edits a list of shapes (SceneColorRegion or SceneObstacle — same geometry + color fields)
+// through SceneEvent proxies so the events gizmo can drag them. Only interactive when `edit`;
+// otherwise it just draws them so they stay visible behind the other tab.
+// `fixedTint` (optional) replaces every shape's own color, `fillScale` thins the fill so what's
+// underneath (e.g. the preview particles under a group) stays visible.
+template <typename Shape>
+static void RunShapeGizmo(std::vector<Shape>& list, const Shape& place, int& selected, bool edit,
+                          const EventGizmo::View& view, const char* label,
+                          const ImVec4* fixedTint = nullptr, float fillScale = 1.f) {
+    std::vector<SceneEvent> proxy(list.size());
+    std::vector<ImVec4>     tints(list.size());
+    for (size_t i = 0; i < list.size(); i++) {
+        const Shape& s = list[i];
+        proxy[i].shape = s.shape;
+        proxy[i].cx = s.cx; proxy[i].cy = s.cy;
+        proxy[i].radius = s.radius; proxy[i].halfW = s.halfW; proxy[i].halfH = s.halfH;
+        tints[i] = fixedTint ? *fixedTint : ImVec4(s.color.r, s.color.g, s.color.b, 1.f);
+    }
+    SceneEvent proxyDefaults;
+    proxyDefaults.shape = place.shape;
+    int dummySel = -1;
+    EventGizmo::Context c;
+    c.view        = view;
+    c.events      = &proxy;
+    c.selected    = edit ? &selected : &dummySel;
+    c.defaults    = &proxyDefaults;
+    c.interactive = edit;
+    c.showArrows  = false;
+    c.colors      = &tints;
+    c.label       = label;
+    c.fillScale   = fillScale;
+    const EventGizmo::Result rr = EventGizmo::Update(c);
+    if (rr.deleted >= 0 && rr.deleted < static_cast<int>(list.size()))
+        list.erase(list.begin() + rr.deleted);
+    for (size_t i = 0; i < list.size() && i < proxy.size(); i++) {
+        list[i].cx = proxy[i].cx; list[i].cy = proxy[i].cy;
+        list[i].radius = proxy[i].radius;
+        list[i].halfW = proxy[i].halfW; list[i].halfH = proxy[i].halfH;
+    }
+    if (rr.created && proxy.size() > list.size()) {
+        const SceneEvent& p = proxy.back();
+        Shape n = place;
+        n.shape = p.shape; n.cx = p.cx; n.cy = p.cy;
+        n.radius = p.radius; n.halfW = p.halfW; n.halfH = p.halfH;
+        list.push_back(n);
+    }
+}
+
+// ---- Setup-view particle preview ---------------------------------------------------------------
+// While configuring, every particle the scene would spawn is drawn at its real size, spacing and
+// color — through the same instanced circle path as the sim, with no physics, so it stays instant
+// while you drag a group or change particle radius/packing/count. Mirrors Init()'s layout rules.
+
+constexpr int PreviewParticleCap = 100000; // the renderer's instance capacity (VulkanContext kMaxObjects)
+
+// The groups the menu shows: the scene's own, or (before the menu has seeded them) the legacy block.
+static std::vector<SceneGroup> MenuPreviewGroups(const Scene& s, float halfW, float halfH) {
+    if (s.useGroups) return s.groups;
+    Scene tmp = s; // SpawnBlockAsGroup writes the derived grid counts back into its scene
+    return { SpawnBlockAsGroup(tmp, halfW, halfH) };
+}
+
+// The color Init()'s spawnAt gives a particle spawned at (x, y) with group color `base`.
+static Color PreviewParticleColor(const Scene& s, const PatternSampler& sampler, const Color& base, float x, float y) {
+    Color c = base;
+    if (Color pc; sampler.Sample(x, y, pc)) c = pc;
+    if (s.blendColorRegions) {
+        BlendColorRegions(s.colorRegions, x, y, c, s.blendStrength, s.blendRadius);
+        return c;
+    }
+    for (const SceneColorRegion& r : s.colorRegions) {
+        const float dx = x - r.cx, dy = y - r.cy;
+        const bool inside = r.shape == EventShape::Circle
+            ? dx * dx + dy * dy <= r.radius * r.radius
+            : std::fabs(dx) <= r.halfW && std::fabs(dy) <= r.halfH;
+        if (inside) c = r.color;
+    }
+    return c;
+}
+
+static void AddMenuPreviewParticles() {
+    const Scene& s = menuConfig.scene;
+    float halfW, halfH;
+    MenuHalfExtents(s, halfW, halfH);
+    const std::vector<SceneGroup> groups = MenuPreviewGroups(s, halfW, halfH);
+
+    // The box every group fits in — the frame a color pattern is laid over (as in Init()).
+    float boxMinX = 0.f, boxMinY = 0.f, boxMaxX = 0.f, boxMaxY = 0.f;
+    bool  boxSet = false;
+    for (const SceneGroup& g : groups) {
+        const float hx = g.shape == EventShape::Circle ? g.radius : g.halfW;
+        const float hy = g.shape == EventShape::Circle ? g.radius : g.halfH;
+        boxMinX = boxSet ? std::min(boxMinX, g.cx - hx) : g.cx - hx;
+        boxMaxX = boxSet ? std::max(boxMaxX, g.cx + hx) : g.cx + hx;
+        boxMinY = boxSet ? std::min(boxMinY, g.cy - hy) : g.cy - hy;
+        boxMaxY = boxSet ? std::max(boxMaxY, g.cy + hy) : g.cy + hy;
+        boxSet = true;
+    }
+    const PatternSampler sampler(s.colorPattern, boxMinX, boxMinY, boxMaxX, boxMaxY,
+                                 s.blendColorRegions ? s.blendStrength : 0.f, s.blendRadius);
+
+    const float radius = s.particles.circleRadius;
+    int budget = PreviewParticleCap;
+    for (const SceneGroup& g : groups) {
+        const Color base = g.customColor ? g.color : s.particles.circleColor;
+        ForEachGroupPoint(g, GroupSpacing(g, radius), [&](float x, float y) {
+            if (budget <= 0) return;
+            if (InsideAnyObstacle(s.obstacles, x, y, radius)) return;
+            budget--;
+            app.AddCircle(x, y, radius, PreviewParticleColor(s, sampler, base, x, y));
+        });
+    }
+}
+
+// Keeps the smallest shape of `list` containing (x, y) in `best` (smaller = more specific, so a
+// small obstacle inside a big group wins over the group).
+template <typename Shape>
+static void PickSmallestHit(const std::vector<Shape>& list, float x, float y, int layer,
+                            int& bestLayer, int& bestIndex, float& bestArea) {
+    for (int i = 0; i < static_cast<int>(list.size()); i++) {
+        const Shape& s = list[i];
+        const float dx = x - s.cx, dy = y - s.cy;
+        const bool  circle = s.shape == EventShape::Circle;
+        const bool  inside = circle ? dx * dx + dy * dy <= s.radius * s.radius
+                                    : std::fabs(dx) <= s.halfW && std::fabs(dy) <= s.halfH;
+        const float area   = circle ? 3.14159265f * s.radius * s.radius : 4.f * s.halfW * s.halfH;
+        if (inside && area < bestArea) { bestArea = area; bestLayer = layer; bestIndex = i; }
+    }
+}
+
+// Setup view: double-clicking any group, obstacle, color area or event selects it and brings its
+// tab to the front in the right panel, whichever tab is open (a single click only works on the
+// layer of the open tab).
+static void SelectShapeOnDoubleClick(const EventGizmo::View& view) {
+    const ImGuiIO& io = ImGui::GetIO();
+    // The raw per-frame flag, not IsMouseDoubleClicked(): that one also asks ImGui's key-owner
+    // system, which can veto the click when a widget claimed the mouse this frame.
+    if (!io.MouseDoubleClicked[ImGuiMouseButton_Left]) return;
+    const bool inView = io.MousePos.x >= view.clipMin.x && io.MousePos.x <= view.clipMax.x &&
+                        io.MousePos.y >= view.clipMin.y && io.MousePos.y <= view.clipMax.y;
+    if (io.WantCaptureMouse || !inView) return;
+
+    const float wx =  (io.MousePos.x - view.origin.x) / view.scale;
+    const float wy = -(io.MousePos.y - view.origin.y) / view.scale;
+    Scene& s = menuConfig.scene;
+
+    int bestLayer = -1, bestIndex = -1;
+    float bestArea = FLT_MAX;
+    PickSmallestHit(s.groups,       wx, wy, 0, bestLayer, bestIndex, bestArea);
+    PickSmallestHit(s.obstacles,    wx, wy, 1, bestLayer, bestIndex, bestArea);
+    PickSmallestHit(s.colorRegions, wx, wy, 2, bestLayer, bestIndex, bestArea);
+    PickSmallestHit(s.events,       wx, wy, 3, bestLayer, bestIndex, bestArea);
+
+    // Brings a docked panel's tab to the front (SetWindowFocus alone doesn't always reselect it).
+    auto showTab = [](const char* name) {
+        ImGuiWindow* w = ImGui::FindWindowByName(name);
+        if (!w) return;
+        if (w->DockNode && w->DockNode->TabBar)
+            w->DockNode->TabBar->NextSelectedTabId = w->TabId;
+        ImGui::SetWindowFocus(name);
+    };
+    switch (bestLayer) {
+        case 0: selectedGroup    = bestIndex; showTab("Groups###GroupsPanel");           break;
+        case 1: selectedObstacle = bestIndex; showTab("Obstacles###ObstaclesPanel");     break;
+        case 2: selectedRegion   = bestIndex; showTab("Persistent Color###ColorsPanel"); break;
+        case 3: selectedEvent    = bestIndex; showTab("Events###RightPanel");            break;
+        default: break;
+    }
+}
+
 static void DrawSimOverlay(const Workspace::Frame& frame) {
     const ImGuiIO& io = ImGui::GetIO();
     const float fb = std::max(io.DisplayFramebufferScale.x, 0.01f); // framebuffer pixels per ImGui point
@@ -1646,84 +2282,34 @@ static void DrawSimOverlay(const Workspace::Frame& frame) {
     view.clipMax = frame.centerMax;
 
     if (appState == AppState::Menu) {
-        // Pre-run preview: the container and the spawn block, so events can be placed visually.
+        // Pre-run preview: the container and the outline of each group, so events can be placed
+        // visually. The particles themselves are drawn by the renderer (AddMenuPreviewParticles).
         const Scene& s = menuConfig.scene;
-        const float halfW = s.boundary.halfWidthPx  > 0.f ? s.boundary.halfWidthPx  : app.RecordingHalfWidth()  * s.boundary.widthFrac;
-        const float halfH = s.boundary.halfHeightPx > 0.f ? s.boundary.halfHeightPx : app.RecordingHalfHeight() * s.boundary.heightFrac;
+        float halfW, halfH;
+        MenuHalfExtents(s, halfW, halfH);
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
         dl->PushClipRect(frame.centerMin, frame.centerMax, true);
         const ImVec2 a(view.origin.x - halfW * view.scale, view.origin.y - halfH * view.scale);
         const ImVec2 b(view.origin.x + halfW * view.scale, view.origin.y + halfH * view.scale);
-        dl->AddRectFilled(a, b, Theme::U32(Theme::WithAlpha(Theme::Panel, 0.45f)), 14.f);
         dl->AddRect(a, b, Theme::U32(Theme::WithAlpha(Theme::TextDim, 0.8f)), 14.f, 0, 3.f);
 
-        const float spacing = s.particles.circleRadius * 3.f * s.spawn.spacingScale;
-        const float cx = s.spawn.offsetXFrac * halfW;
-        // Mirror Init(): a packed (fillBoundary) block is sized to the container, not to gridCount.
-        int countX = s.spawn.gridCountX, countY = s.spawn.gridCountY;
-        if (s.spawn.fillBoundary && !s.spawn.circular) {
-            countX = std::max(static_cast<int>(2.f * halfW / spacing), 1);
-            countY = std::max(static_cast<int>(2.f * halfH / spacing), 1);
-        }
-        const ImU32 fill = Theme::U32(Theme::WithAlpha(Theme::Accent, 0.10f));
-        const ImU32 line = Theme::U32(Theme::WithAlpha(Theme::Accent, 0.45f));
-        const float bw = s.spawn.circular ? spacing * std::sqrt(static_cast<float>(countX * countY) / 3.14159265f)
-                                          : countX * spacing * 0.5f;
-        const float bh = s.spawn.circular ? bw : countY * spacing * 0.5f;
-        if (s.spawn.circular) {
-            const ImVec2 c(view.origin.x + cx * view.scale, view.origin.y);
-            dl->AddCircleFilled(c, bw * view.scale, fill, 96);
-            dl->AddCircle(c, bw * view.scale, line, 96, 1.5f);
-        } else {
-            const ImVec2 pa(view.origin.x + (cx - bw) * view.scale, view.origin.y - bh * view.scale);
-            const ImVec2 pb(view.origin.x + (cx + bw) * view.scale, view.origin.y + bh * view.scale);
-            dl->AddRectFilled(pa, pb, fill, 8.f);
-            dl->AddRect(pa, pb, line, 8.f, 0, 1.5f);
+        const ImU32 line = Theme::U32(ImVec4(0.88f, 0.88f, 0.90f, 0.45f)); // matches the group boxes
+        for (const SceneGroup& g : MenuPreviewGroups(s, halfW, halfH)) {
+            if (g.shape == EventShape::Circle) {
+                const ImVec2 c(view.origin.x + g.cx * view.scale, view.origin.y - g.cy * view.scale);
+                dl->AddCircle(c, g.radius * view.scale, line, 96, 1.5f);
+            } else {
+                const ImVec2 pa(view.origin.x + (g.cx - g.halfW) * view.scale, view.origin.y - (g.cy + g.halfH) * view.scale);
+                const ImVec2 pb(view.origin.x + (g.cx + g.halfW) * view.scale, view.origin.y - (g.cy - g.halfH) * view.scale);
+                dl->AddRect(pa, pb, line, 8.f, 0, 1.5f);
+            }
         }
 
-        // Coarse lattice-aligned sample grid colored exactly as Init()'s spawnAt colors particles.
-        const PatternSampler sampler(s.colorPattern, cx - bw, -bh, cx + bw, bh,
-                                     s.blendColorRegions ? s.blendStrength : 0.f, s.blendRadius);
-        auto previewColor = [&](float x, float y) {
-            Color c = s.particles.circleColor;
-            if (Color pc; sampler.Sample(x, y, pc)) c = pc;
-            if (s.blendColorRegions) {
-                BlendColorRegions(s.colorRegions, x, y, c, s.blendStrength, s.blendRadius);
-                return c;
-            }
-            for (const SceneColorRegion& r : s.colorRegions) {
-                const float dx = x - r.cx, dy = y - r.cy;
-                const bool inside = r.shape == EventShape::Circle
-                    ? dx * dx + dy * dy <= r.radius * r.radius
-                    : std::fabs(dx) <= r.halfW && std::fabs(dy) <= r.halfH;
-                if (inside) c = r.color;
-            }
-            return c;
-        };
-        const float stride = spacing * std::max(1.f, std::round(std::max(bw, bh) / 70.f / spacing));
-        const float hs = stride * 0.5f * view.scale;
-        const float startX = cx - (countX - 1) * spacing * 0.5f;
-        const float startY = -(countY - 1) * spacing * 0.5f;
-        if (s.spawn.circular) {
-            for (float wy = -bh + stride * 0.5f; wy < bh; wy += stride)
-                for (float wx = cx - bw + stride * 0.5f; wx < cx + bw; wx += stride) {
-                    if (std::hypot(wx - cx, wy) > bw) continue;
-                    const Color pc = previewColor(wx, wy);
-                    const ImVec2 q(view.origin.x + wx * view.scale, view.origin.y - wy * view.scale);
-                    dl->AddRectFilled(ImVec2(q.x - hs, q.y - hs), ImVec2(q.x + hs, q.y + hs),
-                                      ImGui::ColorConvertFloat4ToU32(ImVec4(pc.r, pc.g, pc.b, 0.5f)));
-                }
-        } else {
-            for (float wy = startY; wy <= -startY + 0.01f; wy += stride)
-                for (float wx = startX; wx <= cx + (countX - 1) * spacing * 0.5f + 0.01f; wx += stride) {
-                    const Color pc = previewColor(wx, wy);
-                    const ImVec2 q(view.origin.x + wx * view.scale, view.origin.y - wy * view.scale);
-                    dl->AddRectFilled(ImVec2(q.x - hs, q.y - hs), ImVec2(q.x + hs, q.y + hs),
-                                      ImGui::ColorConvertFloat4ToU32(ImVec4(pc.r, pc.g, pc.b, 0.5f)));
-                }
-        }
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "%d particles", countX * countY);
+        const int count = SceneParticleCount(s);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), s.obstacles.empty() ? "%d particles" : "up to %d particles", count);
+        if (count > PreviewParticleCap)
+            std::snprintf(buf + std::strlen(buf), sizeof(buf) - std::strlen(buf), "  (preview shows %d)", PreviewParticleCap);
         dl->AddText(ImVec2(a.x + 14.f, a.y + 10.f), Theme::U32(Theme::TextDim), buf);
         dl->PopClipRect();
     }
@@ -1737,43 +2323,18 @@ static void DrawSimOverlay(const Workspace::Frame& frame) {
         // draw/drag them. Only interactive while the "Persistent Color" tab is open (the events gizmo
         // below is then draw-only), and always drawn so they stay visible.
         const bool editColors = appState == AppState::Menu && colorsTabActive;
+        // Obstacles use the same proxy trick in their own tab.
+        const bool editObstacles = appState == AppState::Menu && obstaclesTabActive;
+        const bool editGroups    = appState == AppState::Menu && groupsTabActive;
         if (appState == AppState::Menu) {
-            auto& regions = menuConfig.scene.colorRegions;
-            std::vector<SceneEvent> proxy(regions.size());
-            std::vector<ImVec4>     tints(regions.size());
-            for (size_t i = 0; i < regions.size(); i++) {
-                const SceneColorRegion& rg = regions[i];
-                proxy[i].shape = rg.shape;
-                proxy[i].cx = rg.cx; proxy[i].cy = rg.cy;
-                proxy[i].radius = rg.radius; proxy[i].halfW = rg.halfW; proxy[i].halfH = rg.halfH;
-                tints[i] = ImVec4(rg.color.r, rg.color.g, rg.color.b, 1.f);
-            }
-            SceneEvent proxyDefaults;
-            proxyDefaults.shape = placeRegionTemplate.shape;
-            int dummySel = -1;
-            EventGizmo::Context rc;
-            rc.view        = view;
-            rc.events      = &proxy;
-            rc.selected    = editColors ? &selectedRegion : &dummySel;
-            rc.defaults    = &proxyDefaults;
-            rc.interactive = editColors;
-            rc.showArrows  = false;
-            rc.colors      = &tints;
-            const EventGizmo::Result rr = EventGizmo::Update(rc);
-            if (rr.deleted >= 0 && rr.deleted < static_cast<int>(regions.size()))
-                regions.erase(regions.begin() + rr.deleted);
-            for (size_t i = 0; i < regions.size() && i < proxy.size(); i++) {
-                regions[i].cx = proxy[i].cx; regions[i].cy = proxy[i].cy;
-                regions[i].radius = proxy[i].radius;
-                regions[i].halfW = proxy[i].halfW; regions[i].halfH = proxy[i].halfH;
-            }
-            if (rr.created && proxy.size() > regions.size()) {
-                const SceneEvent& p = proxy.back();
-                SceneColorRegion n = placeRegionTemplate;
-                n.shape = p.shape; n.cx = p.cx; n.cy = p.cy;
-                n.radius = p.radius; n.halfW = p.halfW; n.halfH = p.halfH;
-                regions.push_back(n);
-            }
+            SelectShapeOnDoubleClick(view);
+            // Group boxes are a very light gray with a thin fill, so the particles inside keep
+            // their own colors in the preview.
+            static const ImVec4 GroupTint(0.88f, 0.88f, 0.90f, 1.f);
+            RunShapeGizmo(menuConfig.scene.groups, placeGroupTemplate, selectedGroup, editGroups, view, "Group",
+                          &GroupTint, 0.2f);
+            RunShapeGizmo(menuConfig.scene.colorRegions, placeRegionTemplate, selectedRegion, editColors, view, "Persistent color area");
+            RunShapeGizmo(menuConfig.scene.obstacles, placeObstacleTemplate, selectedObstacle, editObstacles, view, "Obstacle");
         }
 
         EventGizmo::Context ctx;
@@ -1784,7 +2345,7 @@ static void DrawSimOverlay(const Workspace::Frame& frame) {
         ctx.fired    = &eventFired;
         ctx.simTime  = simTime;
         ctx.live     = appState == AppState::Running;
-        ctx.interactive = !editColors;
+        ctx.interactive = !editColors && !editObstacles && !editGroups;
         const EventGizmo::Result r = EventGizmo::Update(ctx);
         if (ctx.live) {
             eventFired.resize(ctx.events->size(), 0);
@@ -1807,6 +2368,7 @@ static void DrawTopBarContents() {
         case AppState::Running:   paused ? Widgets::Chip("PAUSED", Theme::Amber) : Widgets::Chip("RUNNING", Theme::Teal); break;
         case AppState::Rendering: Widgets::Chip("RENDERING", Theme::Coral); break;
     }
+    if (simFaulted) { ImGui::SameLine(); Widgets::Chip(appState == AppState::Menu ? "LAST RUN DIVERGED" : "DIVERGED", Theme::Coral); }
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%s", (appState == AppState::Menu ? menuConfig.scene.name : ActiveScene.name).c_str());
@@ -1855,6 +2417,21 @@ static void DrawTopBarContents() {
     }
 }
 
+// Drawn instead of DrawUi() when the worker thread is stuck inside a single substep and simMutex
+// can't be taken: it touches no sim state, so it's safe while the worker owns everything.
+static void DrawUnresponsiveUi() {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove;
+    if (ImGui::Begin("##simNotResponding", nullptr, flags)) {
+        ImGui::TextColored(Theme::Coral, "Simulation not responding");
+        ImGui::TextDisabled("A single substep is taking unusually long. The window stays alive;");
+        ImGui::TextDisabled("close it to quit, or wait for the sim to recover.");
+    }
+    ImGui::End();
+}
+
 // The single UI callback (see main()): top bar, dockspace, the two panels, then the sim-view
 // overlay — in that order, so the gizmo's io.WantCaptureMouse check already knows about this
 // frame's panels.
@@ -1864,6 +2441,8 @@ static void DrawUi() {
     static int      lastScene = -2;
     if (appState != lastState || menuConfig.sceneIndex != lastScene) {
         selectedEvent = -1;
+        selectedObstacle = -1;
+        selectedGroup = -1;
         lastState = appState;
         lastScene = menuConfig.sceneIndex;
     }
@@ -1875,6 +2454,8 @@ static void DrawUi() {
     DrawLeftPanel();
     DrawEventsPanel();
     DrawColorsWindow();
+    DrawGroupsWindow();
+    DrawObstaclesWindow();
     DrawSimOverlay(frame);
 }
 
@@ -1927,6 +2508,23 @@ static void DrawBoundary(App& app) {
     }
 }
 
+// Draws the scene's obstacles through the renderer (not ImGui), so they show in recordings too.
+// A rect is drawn as an outline thick enough to fill it solid (there is no filled-rect call), and
+// the shared rect budget (VulkanContext kMaxRects) leaves room for the boundary's own rects.
+static float WrapX(float x, float hw); // defined below
+static void DrawObstacles(App& app, bool followCam, float hw) {
+    constexpr size_t MaxObstacleRects = 56;
+    size_t rects = 0;
+    for (const SceneObstacle& o : ActiveScene.obstacles) {
+        const float x = followCam ? WrapX(o.cx - cameraOffsetX, hw) : o.cx;
+        if (o.shape == EventShape::Circle) {
+            app.AddCircle(x, o.cy, o.radius, o.color);
+        } else if (rects++ < MaxObstacleRects) {
+            app.AddRectOutline(x, o.cy, o.halfW, o.halfH, std::max(o.halfW, o.halfH), o.color);
+        }
+    }
+}
+
 // vt is the velocity component tangential to this axis's wall (e.g. vel.y when resolving the
 // x-axis walls); when noSlipWalls is enabled it gets damped on contact instead of passing
 // through untouched, so wall-adjacent particles drag against the boundary rather than free-slip.
@@ -1936,6 +2534,31 @@ static void resolveAxis(float& p, float& v, float& vt, float half, float r) {
     if (p - r < -half) { p = -half + r; if (v < 0.0f) { v *= -physics.restitution; hit = true; } }
     if (p + r >  half) { p =  half - r; if (v > 0.0f) { v *= -physics.restitution; hit = true; } }
     if (hit && physics.noSlipWalls) vt *= 1.0f - physics.friction;
+}
+
+// Pushes a particle of radius r out of every obstacle it overlaps and, if it's moving into the
+// surface, reflects the normal velocity (restitution) and drags the tangential one when no-slip
+// walls are on — the same rules resolveAxis applies to the container walls.
+static void ResolveObstacles(Object& obj, float r) {
+    const auto& physics = ActiveScene.physics;
+    for (const SceneObstacle& o : ActiveScene.obstacles) {
+        float nx, ny;
+        const float sd = ObstacleSurface(o, obj.pos.x, obj.pos.y, nx, ny);
+        if (sd >= r) continue;
+
+        obj.pos.x += nx * (r - sd);
+        obj.pos.y += ny * (r - sd);
+
+        const float vn = obj.vel.x * nx + obj.vel.y * ny;
+        if (vn >= 0.f) continue; // already moving away
+        obj.vel.x -= (1.f + physics.restitution) * vn * nx;
+        obj.vel.y -= (1.f + physics.restitution) * vn * ny;
+        if (physics.noSlipWalls) {
+            const float vnNew = obj.vel.x * nx + obj.vel.y * ny;
+            obj.vel.x -= physics.friction * (obj.vel.x - vnNew * nx);
+            obj.vel.y -= physics.friction * (obj.vel.y - vnNew * ny);
+        }
+    }
 }
 
 // Wraps x into (-hw, hw], the same range periodicX teleporting keeps simulated positions in —
@@ -1953,9 +2576,17 @@ static float WrapX(float x, float hw) {
 // computed — held constant across ActiveScene.physics.forceInterval substeps at a time to trade
 // some staleness back for compute cost. acc is reset only when it's about to be recomputed
 // (see the main loop), not here.
-static void Integrate(float subDt) {
+//
+// Returns false if any particle came out non-finite or absurdly fast (the sim has diverged). Every
+// particle is still integrated, so the scan costs one pass-through's worth of compares, and the
+// caller decides what to do about it (see AdvanceSimulationLocked). Not compatible with -ffast-math,
+// which is allowed to optimize the isfinite test away.
+static bool Integrate(float subDt) {
     const float hw = ScreenHalfWidth(), hh = ScreenHalfHeight();
     const bool  periodicX = ActiveScene.boundary.periodicX;
+    constexpr float MaxSpeedSq = 1.0e12f; // 1e6 px/s — far beyond anything a stable scene reaches
+    bool   finite = true;
+    const bool hasObstacles = !ActiveScene.obstacles.empty();
     double sumVx = 0.0; // mean flow velocity this substep, for the camera-follow display offset
     for (auto& obj : objects) {
         const float r = obj.Radius();
@@ -1971,11 +2602,26 @@ static void Integrate(float subDt) {
             resolveAxis(obj.pos.x, obj.vel.x, obj.vel.y, hw, r);
         }
         resolveAxis(obj.pos.y, obj.vel.y, obj.vel.x, hh, r);
+        if (hasObstacles) {
+            // Obstacle, then walls again, then obstacle: a particle pinned between an obstacle and
+            // a wall ends up legal against both instead of being pushed through one by the other.
+            ResolveObstacles(obj, r);
+            if (!periodicX) resolveAxis(obj.pos.x, obj.vel.x, obj.vel.y, hw, r);
+            resolveAxis(obj.pos.y, obj.vel.y, obj.vel.x, hh, r);
+            ResolveObstacles(obj, r);
+        }
+
+        // NaN fails both tests (the sum is NaN, and NaN < MaxSpeedSq is false); so does inf.
+        if (!std::isfinite(obj.pos.x + obj.pos.y + obj.vel.x + obj.vel.y) ||
+            !(obj.vel.x * obj.vel.x + obj.vel.y * obj.vel.y < MaxSpeedSq))
+            finite = false;
     }
+    if (!finite) return false;
     if (periodicX && cameraFollow && !objects.empty()) {
         cameraOffsetX += static_cast<float>(sumVx / objects.size()) * subDt;
         cameraOffsetX  = WrapX(cameraOffsetX, hw);
     }
+    return true;
 }
 
 // Draws the current particles/boundary and submits the frame (capturing it if a video recording
@@ -1985,6 +2631,15 @@ static void Integrate(float subDt) {
 // a fixed 1/fps dt instead, with no pacing to real time and no ImGui overlay drawn over it (an
 // overlay would get baked straight into the captured video — see VulkanContext::RenderFrame).
 static void DrawAndSubmitFrame(float dt, bool offscreen) {
+    // Particles are read under simMutex (the worker thread owns them while stepping). If the worker
+    // is wedged in one substep the frame is still presented, just without particles, so the UI can
+    // say so — the lock is dropped again before RenderFrame, which blocks on vsync/the GPU.
+    SimLock lk;
+    if (!LockSim(lk, offscreen ? 5000 : 100)) {
+        app.RenderFrame(dt);
+        return;
+    }
+
     const bool coloring = colorMode != ColorMode::Off && !objects.empty();
     float kineticEnergy = 0.f;
     float colorLo = 0.f, colorHi = 0.f;
@@ -2029,14 +2684,17 @@ static void DrawAndSubmitFrame(float dt, bool offscreen) {
         }
     }
     DrawBoundary(app);
+    DrawObstacles(app, followCam, hw);
 
     // Batch rendering (see AdvanceRendering) never touches the swapchain/window at all — offscreen
     // draws+captures every frame unconditionally instead, so it can't be throttled by vsync or by
     // the OS deprioritizing an occluded/backgrounded window.
+    // RenderFrame draws the ImGui callback, which takes simMutex itself, and blocks on vsync/the
+    // GPU — release it so the worker keeps simulating meanwhile.
+    lk.unlock();
     if (offscreen) app.RenderOffscreenFrame();
     else           app.RenderFrame(dt);
-    app.SetObjectCount(static_cast<int>(objects.size()));
-    app.SetKineticEnergy(kineticEnergy);
+    if (!LockSim(lk, offscreen ? 5000 : 100)) return;
 
     if (runIndex != lastRunIndexForKE) { lastRunIndexForKE = runIndex; runFrameForKE = 0; }
     keByFrame.push_back({ runIndex, runFrameForKE++, kineticEnergy });
@@ -2085,11 +2743,21 @@ static void AdvanceRendering() {
     constexpr float FrameBudgetSeconds = 1.f / 30.f;
     const float frameDt = 1.f / static_cast<float>(std::max(activeRun.fps, 1));
 
-    while (BatchRunActive()) {
+    while (BatchRunActive() && !simFaulted) {
         AdvanceSimulation(frameDt);
+        if (simFaulted) break; // don't capture the diverged frame
         DrawAndSubmitFrame(frameDt, /*offscreen=*/true);
         if (std::chrono::duration<float>(Clock::now() - budgetStart).count() >= FrameBudgetSeconds)
             break;
+    }
+
+    // A diverged batch run can't make progress: finish its outputs (what was captured so far is
+    // kept) and fall through to the normal "run finished" handling, which moves on to the next
+    // queued entry or back to the menu. The fault itself stays flagged for the top bar.
+    if (simFaulted) {
+        app.StopRecording();
+        dataRecorder.Stop();
+        profileLogger.Stop();
     }
 
     // StopRecording()/dataRecorder.Stop() here are no-ops if the output already stopped itself on
@@ -2109,20 +2777,21 @@ int main(int, char**) {
     RefreshUserPresets();
 
     app.Init(Config::WindowTitle, Config::WindowWidth, Config::WindowHeight);
-    app.SetUICallback([]() { DrawUi(); });
+    app.SetUICallback([]() {
+        SimLock lk;
+        if (LockSim(lk)) DrawUi();
+        else             DrawUnresponsiveUi();
+    });
 
     objects.reserve(100000);
     keByFrame.reserve(1u << 16); // avoid mid-run reallocations from skewing frame timing
+    StartSimThread();
 
     using Clock = std::chrono::steady_clock;
     auto last = Clock::now();
 
     profiler.MarkFrameStart();
     while (app.PollEvents()) {
-        if (app.TakeF1Toggle()) {
-            profilerOpen = !profilerOpen;
-            app.SetProfilerOpen(profilerOpen);
-        }
         // Drained every frame regardless of appState so a press queued during the menu (or while
         // a text field had focus) never leaks into the next Running session.
         const bool stepPressed    = app.TakeStepForward();
@@ -2137,10 +2806,18 @@ int main(int, char**) {
             if (spacePressed)   TogglePause();
             if (stepPressed)    StepOnce();
             if (bigStepPressed) StepBig();
-            if (!paused) AdvanceSimulation(dt);
+            // The worker thread does the stepping; this just tells it how much time has passed.
+            if (!paused && !simFaulted) QueueSimTime(dt);
             profiler.MarkComputeEnd();
+            lockWaitMs = 0.f;
+            const auto drawStart = Clock::now();
             DrawAndSubmitFrame(dt, /*offscreen=*/false);
             profiler.MarkRenderEnd();
+            // The frame's real CPU render work: everything in DrawAndSubmitFrame minus the time
+            // blocked on the GPU/vsync (RenderFrame) and on the sim thread's lock.
+            const float drawMs = std::chrono::duration<float, std::milli>(Clock::now() - drawStart).count();
+            const float workMs = std::max(drawMs - app.LastBlockedMs() - lockWaitMs, 0.f);
+            renderCpuMs = renderCpuMs * 0.9f + workMs * 0.1f;
         } else if (appState == AppState::Rendering) {
             // Same key Running uses for pause/resume; the Cancel button in DrawRenderingOverlay
             // does the same thing.
@@ -2157,19 +2834,26 @@ int main(int, char**) {
             // frame captured within that tick's budget.
             app.RenderFrame(dt);
         } else {
-            app.RenderFrame(dt); // Menu: just the UI, no particles/bookkeeping
+            AddMenuPreviewParticles(); // Menu: a physics-free preview of the scene's particles
+            app.RenderFrame(dt);
             profiler.MarkComputeEnd();
             profiler.MarkRenderEnd();
         }
 
         if (profiler.Tick()) {
-            app.SetProfilerStats(profiler.GetStats());
-            if (appState == AppState::Running) WriteVelocityProfileCsv();
+            if (appState == AppState::Running) {
+                SimLock lk;
+                if (LockSim(lk, 20)) WriteVelocityProfileCsv();
+            }
         }
 
         profiler.MarkFrameStart();
     }
+    // The worker may be stuck inside a substep (a hung sim is exactly what it exists to survive):
+    // then it can't be joined, and static destructors must not run underneath it.
+    const bool workerStopped = StopSimThread();
     WriteKineticEnergyCsv(keByFrame);
     app.Shutdown();
+    if (!workerStopped) std::_Exit(0);
     return 0;
 }

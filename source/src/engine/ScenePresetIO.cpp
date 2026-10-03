@@ -187,6 +187,8 @@ const std::vector<PresetField>& Fields() {
                 [](Scene& s, const std::string& v) { s.colorPattern.imagePath = v; } },
         { "spawn.spacingScale", [](const Scene& s) { return FormatFloat(s.spawn.spacingScale); },
                                  [](Scene& s, const std::string& v) { s.spawn.spacingScale = std::max(ParseFloat(v, s.spawn.spacingScale), 0.1f); } },
+        { "groups.enabled",    [](const Scene& s) { return FormatBool(s.useGroups); },
+                                [](Scene& s, const std::string& v) { s.useGroups = ParseBool(v, s.useGroups); } },
         { "spawn.circular",    [](const Scene& s) { return FormatBool(s.spawn.circular); },
                                 [](Scene& s, const std::string& v) { s.spawn.circular = ParseBool(v, s.spawn.circular); } },
 
@@ -311,6 +313,113 @@ bool LoadPinKey(Scene& out, const std::string& key, const std::string& value) {
     return false;
 }
 
+// Obstacles: "obstacle.count=N" plus "obstacle.<i>.<field>=value", like color regions.
+struct ObstacleField {
+    const char*                                              key;
+    std::function<std::string(const SceneObstacle&)>         get;
+    std::function<void(SceneObstacle&, const std::string&)>  set;
+};
+
+const std::vector<ObstacleField>& ObstacleFields() {
+    static const std::vector<ObstacleField> fields = {
+        { "shape",  [](const SceneObstacle& o) { return std::string(o.shape == EventShape::Rect ? "Rect" : "Circle"); },
+                     [](SceneObstacle& o, const std::string& v) { if (v == "Rect") o.shape = EventShape::Rect; else if (v == "Circle") o.shape = EventShape::Circle; } },
+        { "cx",     [](const SceneObstacle& o) { return FormatFloat(o.cx); },
+                     [](SceneObstacle& o, const std::string& v) { o.cx = ParseFloat(v, o.cx); } },
+        { "cy",     [](const SceneObstacle& o) { return FormatFloat(o.cy); },
+                     [](SceneObstacle& o, const std::string& v) { o.cy = ParseFloat(v, o.cy); } },
+        { "radius", [](const SceneObstacle& o) { return FormatFloat(o.radius); },
+                     [](SceneObstacle& o, const std::string& v) { o.radius = ParseFloat(v, o.radius); } },
+        { "halfW",  [](const SceneObstacle& o) { return FormatFloat(o.halfW); },
+                     [](SceneObstacle& o, const std::string& v) { o.halfW = ParseFloat(v, o.halfW); } },
+        { "halfH",  [](const SceneObstacle& o) { return FormatFloat(o.halfH); },
+                     [](SceneObstacle& o, const std::string& v) { o.halfH = ParseFloat(v, o.halfH); } },
+        { "r",      [](const SceneObstacle& o) { return FormatFloat(o.color.r); },
+                     [](SceneObstacle& o, const std::string& v) { o.color.r = ParseFloat(v, o.color.r); } },
+        { "g",      [](const SceneObstacle& o) { return FormatFloat(o.color.g); },
+                     [](SceneObstacle& o, const std::string& v) { o.color.g = ParseFloat(v, o.color.g); } },
+        { "b",      [](const SceneObstacle& o) { return FormatFloat(o.color.b); },
+                     [](SceneObstacle& o, const std::string& v) { o.color.b = ParseFloat(v, o.color.b); } },
+        { "a",      [](const SceneObstacle& o) { return FormatFloat(o.color.a); },
+                     [](SceneObstacle& o, const std::string& v) { o.color.a = ParseFloat(v, o.color.a); } },
+    };
+    return fields;
+}
+
+bool LoadObstacleKey(Scene& out, const std::string& key, const std::string& value) {
+    if (key.rfind("obstacle.", 0) != 0) return false;
+    const std::string rest = key.substr(9);
+    if (rest == "count") {
+        out.obstacles.resize(static_cast<size_t>(std::clamp(ParseInt(value, 0), 0, 1024)));
+        return true;
+    }
+    const size_t dot = rest.find('.');
+    if (dot == std::string::npos) return false;
+    const int idx = ParseInt(rest.substr(0, dot), -1);
+    if (idx < 0 || idx >= 1024) return true;
+    if (static_cast<size_t>(idx) >= out.obstacles.size()) out.obstacles.resize(static_cast<size_t>(idx) + 1);
+    const std::string field = rest.substr(dot + 1);
+    for (const auto& f : ObstacleFields())
+        if (field == f.key) { f.set(out.obstacles[static_cast<size_t>(idx)], value); return true; }
+    return false;
+}
+
+// Particle groups: "group.count=N" plus "group.<i>.<field>=value". Only meaningful with
+// groups.enabled=1 (otherwise the legacy spawn.* block is used).
+struct GroupField {
+    const char*                                         key;
+    std::function<std::string(const SceneGroup&)>       get;
+    std::function<void(SceneGroup&, const std::string&)> set;
+};
+
+const std::vector<GroupField>& GroupFields() {
+    static const std::vector<GroupField> fields = {
+        { "shape",   [](const SceneGroup& g) { return std::string(g.shape == EventShape::Rect ? "Rect" : "Circle"); },
+                      [](SceneGroup& g, const std::string& v) { if (v == "Rect") g.shape = EventShape::Rect; else if (v == "Circle") g.shape = EventShape::Circle; } },
+        { "cx",      [](const SceneGroup& g) { return FormatFloat(g.cx); },
+                      [](SceneGroup& g, const std::string& v) { g.cx = ParseFloat(v, g.cx); } },
+        { "cy",      [](const SceneGroup& g) { return FormatFloat(g.cy); },
+                      [](SceneGroup& g, const std::string& v) { g.cy = ParseFloat(v, g.cy); } },
+        { "radius",  [](const SceneGroup& g) { return FormatFloat(g.radius); },
+                      [](SceneGroup& g, const std::string& v) { g.radius = ParseFloat(v, g.radius); } },
+        { "halfW",   [](const SceneGroup& g) { return FormatFloat(g.halfW); },
+                      [](SceneGroup& g, const std::string& v) { g.halfW = ParseFloat(v, g.halfW); } },
+        { "halfH",   [](const SceneGroup& g) { return FormatFloat(g.halfH); },
+                      [](SceneGroup& g, const std::string& v) { g.halfH = ParseFloat(v, g.halfH); } },
+        { "spacing", [](const SceneGroup& g) { return FormatFloat(g.spacingScale); },
+                      [](SceneGroup& g, const std::string& v) { g.spacingScale = std::max(ParseFloat(v, g.spacingScale), 0.1f); } },
+        { "ownColor",[](const SceneGroup& g) { return FormatBool(g.customColor); },
+                      [](SceneGroup& g, const std::string& v) { g.customColor = ParseBool(v, g.customColor); } },
+        { "r",       [](const SceneGroup& g) { return FormatFloat(g.color.r); },
+                      [](SceneGroup& g, const std::string& v) { g.color.r = ParseFloat(v, g.color.r); } },
+        { "g",       [](const SceneGroup& g) { return FormatFloat(g.color.g); },
+                      [](SceneGroup& g, const std::string& v) { g.color.g = ParseFloat(v, g.color.g); } },
+        { "b",       [](const SceneGroup& g) { return FormatFloat(g.color.b); },
+                      [](SceneGroup& g, const std::string& v) { g.color.b = ParseFloat(v, g.color.b); } },
+        { "a",       [](const SceneGroup& g) { return FormatFloat(g.color.a); },
+                      [](SceneGroup& g, const std::string& v) { g.color.a = ParseFloat(v, g.color.a); } },
+    };
+    return fields;
+}
+
+bool LoadGroupKey(Scene& out, const std::string& key, const std::string& value) {
+    if (key.rfind("group.", 0) != 0) return false;
+    const std::string rest = key.substr(6);
+    if (rest == "count") {
+        out.groups.resize(static_cast<size_t>(std::clamp(ParseInt(value, 0), 0, 1024)));
+        return true;
+    }
+    const size_t dot = rest.find('.');
+    if (dot == std::string::npos) return false;
+    const int idx = ParseInt(rest.substr(0, dot), -1);
+    if (idx < 0 || idx >= 1024) return true;
+    if (static_cast<size_t>(idx) >= out.groups.size()) out.groups.resize(static_cast<size_t>(idx) + 1);
+    const std::string field = rest.substr(dot + 1);
+    for (const auto& f : GroupFields())
+        if (field == f.key) { f.set(out.groups[static_cast<size_t>(idx)], value); return true; }
+    return false;
+}
+
 } // namespace
 
 bool SaveScenePreset(const std::filesystem::path& path, const Scene& scene) {
@@ -326,6 +435,14 @@ bool SaveScenePreset(const std::filesystem::path& path, const Scene& scene) {
     for (size_t i = 0; i < scene.colorRegions.size(); i++)
         for (const auto& f : PinFields())
             out << "pin." << i << '.' << f.key << '=' << f.get(scene.colorRegions[i]) << '\n';
+    out << "group.count=" << scene.groups.size() << '\n';
+    for (size_t i = 0; i < scene.groups.size(); i++)
+        for (const auto& f : GroupFields())
+            out << "group." << i << '.' << f.key << '=' << f.get(scene.groups[i]) << '\n';
+    out << "obstacle.count=" << scene.obstacles.size() << '\n';
+    for (size_t i = 0; i < scene.obstacles.size(); i++)
+        for (const auto& f : ObstacleFields())
+            out << "obstacle." << i << '.' << f.key << '=' << f.get(scene.obstacles[i]) << '\n';
     return true;
 }
 
@@ -345,7 +462,7 @@ bool LoadScenePreset(const std::filesystem::path& path, Scene& out) {
             [&](const PresetField& f) { return key == f.key; });
         if (it != fields.end())
             it->set(out, value);
-        else if (!LoadEventKey(out, key, value) && !LoadPinKey(out, key, value))
+        else if (!LoadEventKey(out, key, value) && !LoadPinKey(out, key, value) && !LoadObstacleKey(out, key, value) && !LoadGroupKey(out, key, value))
             std::cerr << "LoadScenePreset: unknown key '" << key << "' in " << path << ", skipping\n";
     }
     return true;

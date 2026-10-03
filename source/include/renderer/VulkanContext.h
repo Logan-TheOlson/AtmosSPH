@@ -20,11 +20,9 @@ public:
     void AddRectOutline(float cx, float cy, float halfWidth, float halfHeight, float borderThickness, Color color);
     void RenderFrame(float dt);
     void Shutdown();
-    void SetProfilerOpen(bool open)                 { profilerOpen_ = open; }
-    void SetProfilerStats(const Profiler::Stats& s) { profilerStats_ = s; }
-    void SetObjectCount(int n)                      { objectCount_ = n; }
-    void SetKineticEnergy(float ke)                 { kineticEnergy_ = ke; }
     void SetUICallback(std::function<void()> cb)    { uiCallback_ = std::move(cb); }
+    // Milliseconds the last RenderFrame() spent blocked on the GPU/vsync rather than working.
+    float LastBlockedMs() const                     { return blockedMs_; }
     int   Width()      const { return (int)swapchainExtent.width; }
     int   Height()     const { return (int)swapchainExtent.height; }
     float HalfWidth()  const { return swapchainExtent.width  * 0.5f; }
@@ -191,11 +189,8 @@ private:
     std::vector<RectData>   rects;
 
     SceneViewport   sceneViewport_{};
-    bool            profilerOpen_{ false };
-    Profiler::Stats profilerStats_{};
-    int             objectCount_{ 0 };
-    float           kineticEnergy_{ 0.f };
     std::function<void()> uiCallback_;
+    float                 blockedMs_{ 0.f };
 
     // Frame recording: the final composited image is copied into one of a small ring of
     // host-visible readback buffers. Recorder's background thread reads a slot directly (an

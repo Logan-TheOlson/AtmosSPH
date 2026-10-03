@@ -13,15 +13,11 @@ public:
     void Shutdown();
     void AddCircle(float cx, float cy, float radius, Color color);
     void AddRectOutline(float cx, float cy, float halfWidth, float halfHeight, float borderThickness, Color color);
-    bool TakeF1Toggle()                             { return window.TakeF1Toggle(); }
-    bool TakeSpaceToggle()                          { return window.TakeSpaceToggle(); }
+    bool TakeSpaceToggle()                         { return window.TakeSpaceToggle(); }
     bool TakeStepForward()                          { return window.TakeStepForward(); }
     bool TakeStepForwardBig()                       { return window.TakeStepForwardBig(); }
-    void SetProfilerOpen(bool open)                 { vk.SetProfilerOpen(open); }
-    void SetProfilerStats(const Profiler::Stats& s) { vk.SetProfilerStats(s); }
-    void SetObjectCount(int n)                      { vk.SetObjectCount(n); }
-    void SetKineticEnergy(float ke)                 { vk.SetKineticEnergy(ke); }
     void SetUICallback(std::function<void()> cb)    { vk.SetUICallback(std::move(cb)); }
+    float LastBlockedMs() const                     { return vk.LastBlockedMs(); }
     int   Width()      const;
     int   Height()     const;
     float HalfWidth()  const;

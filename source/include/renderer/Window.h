@@ -8,14 +8,12 @@ public:
     void Shutdown();
 
     SDL_Window* Handle() const { return window; }
-    bool TakeF1Toggle();        // returns true once per F1 press
     bool TakeSpaceToggle();     // returns true once per Space press (pause/resume)
     bool TakeStepForward();     // returns true once per Right Arrow press (step 1 frame)
     bool TakeStepForwardBig();  // returns true once per Left Arrow press (step several frames)
 
 private:
     SDL_Window* window{ nullptr };
-    bool        f1Toggled_{ false };
     bool        spaceToggled_{ false };
     bool        stepForward_{ false };
     bool        stepForwardBig_{ false };

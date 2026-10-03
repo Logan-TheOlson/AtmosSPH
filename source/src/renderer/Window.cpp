@@ -15,8 +15,6 @@ bool Window::PollEvents() {
         ImGui_ImplSDL3_ProcessEvent(&event);
         if (event.type == SDL_EVENT_QUIT) return false;
         if (event.type == SDL_EVENT_KEY_DOWN) {
-            if (event.key.scancode == SDL_SCANCODE_F1) f1Toggled_ = true;
-
             // Gated on WantCaptureKeyboard (and no-repeat) so typing in an ImGui text field
             // doesn't toggle pause/step, and holding the key doesn't fire a step every repeat.
             if (!event.key.repeat && !ImGui::GetIO().WantCaptureKeyboard) {
@@ -26,12 +24,6 @@ bool Window::PollEvents() {
             }
         }
     }
-    return true;
-}
-
-bool Window::TakeF1Toggle() {
-    if (!f1Toggled_) return false;
-    f1Toggled_ = false;
     return true;
 }
 

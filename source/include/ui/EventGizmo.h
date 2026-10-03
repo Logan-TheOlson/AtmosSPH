@@ -31,6 +31,8 @@ namespace EventGizmo {
         // arrow/handle, and an optional per-area tint replacing the mode colors.
         bool                     showArrows = true;
         const std::vector<ImVec4>* colors   = nullptr;
+        const char*              label      = "Persistent color area";  // tooltip name when showArrows is false
+        float                    fillScale  = 1.f;      // multiplies the area fill opacity (< 1 lets what's underneath show through)
     };
 
     struct Result {

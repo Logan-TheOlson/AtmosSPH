@@ -40,7 +40,14 @@ namespace {
     uint32_t tableSize = 0;
 }
 
-static int32_t CellCoord(float p) { return static_cast<int32_t>(std::floor(p / CellSize)); }
+// Clamped and NaN-safe: casting a NaN/out-of-range float to int32_t is UB, and a diverged particle
+// must never be able to index outside the grid (a non-finite one just lands in cell 0).
+static int32_t CellCoord(float p) {
+    constexpr float Limit = 1.0e9f;
+    const float c = std::floor(p / CellSize);
+    if (!std::isfinite(c)) return 0;
+    return static_cast<int32_t>(std::clamp(c, -Limit, Limit));
+}
 
 // Teschner et al.'s spatial-hash primes; unsigned so the multiply can't hit signed overflow UB.
 static uint32_t HashCell(int32_t x, int32_t y) {
@@ -178,6 +185,47 @@ static void ForEachGhost(const Vec2& pos, Fn&& fn) {
     if (wx.active && wy.active)  pass(true,  true);
 }
 
+// Same method of images as ForEachGhost, but across each scene obstacle's surface. A flat wall's
+// mirror is exact; here every obstacle within Radius of `pos` is mirrored across the tangent plane
+// at its nearest surface point (see ObstacleSurface), which is exact for a rect face and good for
+// a circle whose radius is well above the smoothing radius. Particles are never inside an
+// obstacle (Init skips them, Integrate pushes them out), so sd < 0 is simply ignored.
+template <typename Fn>
+static void ForEachObstacleGhost(const Vec2& pos, Fn&& fn) {
+    const auto& obstacles = ActiveScene.obstacles;
+    if (obstacles.empty()) return;
+    const bool noSlip = ActiveScene.physics.noSlipWalls;
+
+    for (const SceneObstacle& o : obstacles) {
+        float nx, ny;
+        const float sd = ObstacleSurface(o, pos.x, pos.y, nx, ny);
+        if (sd < 0.f || sd >= Radius) continue;
+
+        const Vec2 q(pos.x - nx * sd, pos.y - ny * sd);                 // nearest surface point
+        const Vec2 query(pos.x - 2.f * sd * nx, pos.y - 2.f * sd * ny); // pos mirrored across the plane
+        ForEachNeighbor(query, [&](int32_t j) {
+            const Vec2  p  = hotPos[j];
+            const float dn = (p.x - q.x) * nx + (p.y - q.y) * ny;
+            const Vec2  gp(p.x - 2.f * dn * nx, p.y - 2.f * dn * ny);
+
+            // A true boundary image lives inside the solid. Around a convex corner (or on a curved
+            // surface) the tangent plane's mirror throws neighbors beside the obstacle into the
+            // fluid instead: phantom particles that over-repel and fling fluid off the corner.
+            float gnx, gny;
+            if (ObstacleSurface(o, gp.x, gp.y, gnx, gny) >= 0.f) return;
+
+            Vec2 gv = hotVel[j];
+            if (noSlip) {
+                gv = gv * -1.f;
+            } else {
+                const float vn = gv.x * nx + gv.y * ny; // free-slip: only the normal component flips
+                gv = Vec2(gv.x - 2.f * vn * nx, gv.y - 2.f * vn * ny);
+            }
+            fn(Ghost{ gp, gv, j });
+        });
+    }
+}
+
 // Periodic-image particles for a wrapped X boundary (see SceneBoundary::periodicX): a particle
 // near the right edge needs the real particles just past the left edge as neighbors (and vice
 // versa) for its density/pressure to come out as if the domain just continued — exactly what an
@@ -239,7 +287,9 @@ namespace {
 // whenever a new scene is applied — never per-frame, so the hot loop below just reads plain
 // floats instead of paying for std::pow/std::sqrt or a scene-struct indirection per particle pair.
 void RecomputeSphConstants() {
-    Radius   = ActiveScene.particles.smoothingRadius;
+    // Floored: a zero/negative radius (an easy typo in the UI) would divide by zero in the cell
+    // size and every kernel norm below.
+    Radius   = std::max(ActiveScene.particles.smoothingRadius, 0.1f);
     RadiusSq = Radius * Radius;
     CellSize = 2.f * Radius;
 
@@ -338,6 +388,7 @@ static void CalculateDensity (int32_t k)
 
     ForEachNeighbor(pos, [&](int32_t j) { accumulate(hotPos[j]); });
     ForEachGhost(pos, [&](const Ghost& g) { accumulate(g.pos); }); // no self-exclusion, see Ghost comment
+    ForEachObstacleGhost(pos, [&](const Ghost& g) { accumulate(g.pos); });
     ForEachPeriodicX(pos, [&](const Ghost& g) { accumulate(g.pos); }); // ditto — real neighbors, not self
 
     hotDensity[k] = density;
@@ -404,6 +455,9 @@ static void CalculatePressureForce (int32_t k)
     ForEachGhost(pos, [&](const Ghost& g) {
         accumulate(g.pos, g.vel, hotDensity[g.src], hotPressure[g.src]);
     });
+    ForEachObstacleGhost(pos, [&](const Ghost& g) {
+        accumulate(g.pos, g.vel, hotDensity[g.src], hotPressure[g.src]);
+    });
     ForEachPeriodicX(pos, [&](const Ghost& g) {
         accumulate(g.pos, g.vel, hotDensity[g.src], hotPressure[g.src]);
     });
@@ -414,25 +468,34 @@ static void CalculatePressureForce (int32_t k)
 // ------------- Simulation
 void Init() {
     const auto& particles = ActiveScene.particles;
-    auto&       spawn     = ActiveScene.spawn;
+    const float radius    = particles.circleRadius;
 
-    const float radius  = particles.circleRadius;
-    const float spacing = radius * 3.0f * spawn.spacingScale;
-    if (spawn.fillBoundary && !spawn.circular) {
-        spawn.gridCountX = std::max(static_cast<int>(2.f * ScreenHalfWidth()  / spacing), 1);
-        spawn.gridCountY = std::max(static_cast<int>(2.f * ScreenHalfHeight() / spacing), 1);
+    // A scene without groups spawns the one block its SceneSpawn describes.
+    std::vector<SceneGroup> groups;
+    if (ActiveScene.useGroups) groups = ActiveScene.groups;
+    else                       groups.push_back(SpawnBlockAsGroup(ActiveScene, ScreenHalfWidth(), ScreenHalfHeight()));
+
+    // The box every group fits in — the frame a color pattern is laid over.
+    float boxMinX = 0.f, boxMinY = 0.f, boxMaxX = 0.f, boxMaxY = 0.f;
+    bool  boxSet = false;
+    for (const SceneGroup& g : groups) {
+        const float hx = g.shape == EventShape::Circle ? g.radius : g.halfW;
+        const float hy = g.shape == EventShape::Circle ? g.radius : g.halfH;
+        boxMinX = boxSet ? std::min(boxMinX, g.cx - hx) : g.cx - hx;
+        boxMaxX = boxSet ? std::max(boxMaxX, g.cx + hx) : g.cx + hx;
+        boxMinY = boxSet ? std::min(boxMinY, g.cy - hy) : g.cy - hy;
+        boxMaxY = boxSet ? std::max(boxMaxY, g.cy + hy) : g.cy + hy;
+        boxSet = true;
     }
-    const float centerX = spawn.offsetXFrac * ScreenHalfWidth();
-
-    // The block the spawn lattice occupies — the frame a color pattern is laid over.
-    const float blockHalfW = spawn.circular ? spacing * std::sqrt(static_cast<float>(spawn.gridCountX * spawn.gridCountY) / Pi)
-                                            : spawn.gridCountX * spacing * 0.5f;
-    const float blockHalfH = spawn.circular ? blockHalfW : spawn.gridCountY * spacing * 0.5f;
-    const PatternSampler pattern(ActiveScene.colorPattern, centerX - blockHalfW, -blockHalfH, centerX + blockHalfW, blockHalfH,
+    const PatternSampler pattern(ActiveScene.colorPattern, boxMinX, boxMinY, boxMaxX, boxMaxY,
                                  ActiveScene.blendColorRegions ? ActiveScene.blendStrength : 0.f, ActiveScene.blendRadius);
 
+    Color baseColor = particles.circleColor; // the group being spawned right now
     auto spawnAt = [&](float x, float y) {
-        Object& o = CreateObject(x, y, Renderable{ .color = particles.circleColor, .shader = Shader::Circle, .geometry = Circle{radius} });
+        // Obstacles are solid: nothing spawns inside one (grown by the particle radius so a
+        // particle never starts overlapping the surface).
+        if (InsideAnyObstacle(ActiveScene.obstacles, x, y, radius)) return;
+        Object& o = CreateObject(x, y, Renderable{ .color = baseColor, .shader = Shader::Circle, .geometry = Circle{radius} });
         if (Color pc; pattern.Sample(x, y, pc)) { o.renderable.color = pc; o.pinnedColor = true; }
         if (ActiveScene.blendColorRegions) {
             if (Color bc = o.renderable.color; BlendColorRegions(ActiveScene.colorRegions, x, y, bc, ActiveScene.blendStrength, ActiveScene.blendRadius)) { o.renderable.color = bc; o.pinnedColor = true; }
@@ -447,31 +510,19 @@ void Init() {
         }
     };
 
-    if (spawn.circular) {
-        // Exactly gridCountX*gridCountY particles, placed directly into a disk via a Fibonacci
-        // ("sunflower"/Vogel) spiral instead of masking a square lattice against a circle -- that
-        // approach only ever approximates the requested count (a circle inscribed in an NxN square
-        // keeps just ~pi/4 of its points). The disk radius is sized so its areal density matches
-        // the square lattice's (one particle per spacing^2), preserving the initial SPH density
-        // this scene's constants were calibrated against.
-        const int   count      = spawn.gridCountX * spawn.gridCountY;
-        const float diskRadius = spacing * std::sqrt(static_cast<float>(count) / Pi);
-        constexpr float GoldenAngle = 2.39996323f; // pi * (3 - sqrt(5))
-        for (int i = 0; i < count; i++) {
-            const float r     = diskRadius * std::sqrt((static_cast<float>(i) + 0.5f) / static_cast<float>(count));
-            const float theta = static_cast<float>(i) * GoldenAngle;
-            spawnAt(centerX + r * std::cos(theta), r * std::sin(theta));
-        }
-    } else {
-        const float startX = centerX - (spawn.gridCountX - 1) * spacing / 2.0f;
-        const float startY = -(spawn.gridCountY - 1) * spacing / 2.0f;
-        for (int x = 0; x < spawn.gridCountX; x++)
-            for (int y = 0; y < spawn.gridCountY; y++)
-                spawnAt(startX + static_cast<float>(x) * spacing, startY + static_cast<float>(y) * spacing);
+    // See ForEachGroupPoint (Scene.h): a circle is a Fibonacci-spiral disk with exactly the count its
+    // area implies (one particle per spacing^2, preserving the initial SPH density the scene's
+    // constants were calibrated against); a rect is a square lattice.
+    for (const SceneGroup& g : groups) {
+        baseColor = g.customColor ? g.color : particles.circleColor;
+        ForEachGroupPoint(g, GroupSpacing(g, radius), spawnAt);
     }
 }
 
 void Update(float) {
+    // A zero/negative/non-finite smoothing radius makes every cell coordinate and kernel norm
+    // degenerate; skip the force pass instead of feeding NaN into the grid.
+    if (!(CellSize > 0.f) || !std::isfinite(CellSize) || objects.empty()) return;
     BuildGrid();
 
     const int32_t n = static_cast<int32_t>(hotPos.size());

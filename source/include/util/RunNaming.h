@@ -11,8 +11,7 @@ namespace RunNaming {
 
 struct RunNameParams {
     std::string sceneName;
-    int         gridCountX     = 0;
-    int         gridCountY     = 0;
+    int         particleCount  = 0;
     bool        gravityEnabled = false;
     float       gravityG       = 0.f; // embedded only when gravityEnabled
     float       stiffness      = 0.f;
@@ -24,7 +23,7 @@ struct RunNameParams {
 // has no letters to take initials from.
 std::string AbbreviateSceneName(const std::string& sceneName);
 
-// e.g. "SG_run003_150x150_g20_k1200" for Self-Gravity, grid 150x150, g=20, stiffness=1200.
+// e.g. "SG_run003_22500p_g20_k1200" for Self-Gravity, 22500 particles, g=20, stiffness=1200.
 std::string BuildBaseName(const RunNameParams& params);
 
 // Monotonic per-process counter starting at 1 — shared by a run's video and CSV output (call once

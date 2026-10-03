@@ -688,33 +688,19 @@ void VulkanContext::RenderFrame(float dt) {
 
     if (uiCallback_) uiCallback_();
 
-    if (profilerOpen_) {
-        ImGui::SetNextWindowPos(ImVec2(10.f, 10.f), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.75f);
-        ImGui::Begin("Profiler", nullptr,
-            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove);
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "%.0f fps", profilerStats_.fps);
-        ImGui::Separator();
-        ImGui::Text("frame   %6.2f ms", profilerStats_.frameMs);
-        ImGui::Text("compute %6.2f ms", profilerStats_.computeMs);
-        ImGui::Text("render  %6.2f ms", profilerStats_.renderMs);
-        ImGui::Separator();
-        ImGui::Text("objects %d", objectCount_);
-        ImGui::Separator();
-        // Total system kinetic energy (mass=1 per particle) — watch this during collisions to
-        // check whether it's just oscillating (expected, undamped) or trending upward (a real
-        // energy-injection bug, e.g. stale force reuse across substeps).
-        ImGui::Text("KE %.1f", kineticEnergy_);
-        ImGui::Separator();
-        ImGui::TextDisabled("F1 to close");
-        ImGui::End();
-    }
-
     ImGui::Render();
 
+    // Time spent blocked on the GPU / vsync (fence wait, image acquire, present), reported via
+    // LastBlockedMs() so the UI can separate real CPU render work from waiting.
+    using BlockClock = std::chrono::steady_clock;
+    blockedMs_ = 0.f;
+    auto addBlocked = [this](BlockClock::time_point since) {
+        blockedMs_ += std::chrono::duration<float, std::milli>(BlockClock::now() - since).count();
+    };
+
+    const auto fenceWaitStart = BlockClock::now();
     chk(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+    addBlocked(fenceWaitStart);
 
     // The wait above proves the previous submission (and any copy it made into a capture slot)
     // has finished on the GPU, so that slot's data is now valid — hand it to Recorder's
@@ -722,7 +708,9 @@ void VulkanContext::RenderFrame(float dt) {
     FlushPendingCapture();
 
     uint32_t imageIndex = 0;
+    const auto acquireStart = BlockClock::now();
     VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquireSem, VK_NULL_HANDLE, &imageIndex);
+    addBlocked(acquireStart);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) { RecreateSwapchain(); circles.clear(); rects.clear(); return; }
     if (acq != VK_SUCCESS) chk(acq);
 
@@ -850,7 +838,9 @@ void VulkanContext::RenderFrame(float dt) {
     chk(vkQueueSubmit(queue, 1, &si, fence));
 
     VkPresentInfoKHR pi{ .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &renderSem, .swapchainCount = 1, .pSwapchains = &swapchain, .pImageIndices = &imageIndex };
+    const auto presentStart = BlockClock::now();
     VkResult presentResult = vkQueuePresentKHR(queue, &pi);
+    addBlocked(presentStart);
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) RecreateSwapchain();
     else if (presentResult != VK_SUCCESS) chk(presentResult);
 

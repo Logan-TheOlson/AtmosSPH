@@ -53,7 +53,12 @@ void BuildQuadtree(const std::vector<Vec2>& pos, int32_t n) {
     // node created during the same pass.
     int32_t levelBegin = 0;
     int32_t levelEnd   = static_cast<int32_t>(nodes.size());
-    while (levelBegin < levelEnd) {
+    int32_t level      = 0;
+    // A hard depth cap: with non-finite positions halfSize is NaN, the MinHalfSize test never
+    // fires, and the tree would otherwise grow until memory runs out. Also keeps the traversal's
+    // fixed-size stack safe (depth * 3 pending siblings + 1 must stay under it).
+    constexpr int32_t MaxLevels = 64;
+    while (levelBegin < levelEnd && level++ < MaxLevels) {
         for (int32_t ni = levelBegin; ni < levelEnd; ni++) {
             const QuadNode node = nodes[ni]; // copy: nodes may reallocate below
             if (node.particleCount <= params.maxLeafParticles || node.halfSize <= MinHalfSize)

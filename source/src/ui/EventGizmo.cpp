@@ -314,8 +314,8 @@ Result Update(const Context& ctx) {
         const bool   tinted = ctx.colors && i < ctx.colors->size();
         const ImVec4 col   = tinted ? (*ctx.colors)[i] : EventColor(e);
 
-        const float fillA = tinted ? (isSel || isHover ? 0.55f : 0.40f)
-                                   : active ? 0.30f : (isSel || isHover ? 0.20f : 0.12f);
+        const float fillA = (tinted ? (isSel || isHover ? 0.55f : 0.40f)
+                                    : active ? 0.30f : (isSel || isHover ? 0.20f : 0.12f)) * ctx.fillScale;
         DrawArea(dl, v, e, Theme::U32(Theme::WithAlpha(col, fillA)),
                  Theme::U32(Theme::WithAlpha(col, isSel ? 1.f : 0.75f)), isSel ? 3.f : 2.f);
 
@@ -383,7 +383,7 @@ Result Update(const Context& ctx) {
                             : hit == Hit::Resize ? HandleCursor(hitHandle)
                                                  : ImGuiMouseCursor_Hand);
         if (hit == Hit::Body && hitIndex >= 0 && !ctx.showArrows) {
-            ImGui::SetTooltip("Persistent color area %d\nDrag to move  -  Del to delete", hitIndex + 1);
+            ImGui::SetTooltip("%s %d\nDrag to move  -  Del to delete", ctx.label, hitIndex + 1);
         } else if (hit == Hit::Body && hitIndex >= 0) {
             const SceneEvent& e = events[hitIndex];
             ImGui::SetTooltip("Event %d  -  %s  -  %s\nstart %.1fs%s\nDrag to move  -  Del to delete",

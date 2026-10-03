@@ -40,7 +40,7 @@ std::string BuildBaseName(const RunNameParams& p) {
 
     std::string base = AbbreviateSceneName(p.sceneName);
     base += runTag;
-    base += "_" + std::to_string(p.gridCountX) + "x" + std::to_string(p.gridCountY);
+    base += "_" + std::to_string(p.particleCount) + "p";
     if (p.gravityEnabled) base += "_g" + FormatCompact(p.gravityG);
     base += "_k" + FormatCompact(p.stiffness);
     return base;
