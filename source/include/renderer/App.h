@@ -22,8 +22,7 @@ public:
     int   Height()     const;
     float HalfWidth()  const;
     float HalfHeight() const;
-    // See VulkanContext::RecordingHalfWidth/Height — what the simulation's own boundary math
-    // should use instead of HalfWidth()/HalfHeight() while a recording is active.
+    // See VulkanContext::RecordingHalfWidth/Height.
     float RecordingHalfWidth()  const { return vk.RecordingHalfWidth(); }
     float RecordingHalfHeight() const { return vk.RecordingHalfHeight(); }
     // See VulkanContext::SetSceneViewport / SceneCenterPx (framebuffer pixels).
@@ -31,17 +30,14 @@ public:
     void  SceneCenterPx(float& cx, float& cy) const { vk.SceneCenterPx(cx, cy); }
 
     // Starts (or restarts) recording the composited frame to <recordingsDir>/<title>.mp4 via
-    // ffmpeg. lengthSeconds <= 0 means "until StopRecording() is called".
+    // ffmpeg. lengthSeconds <= 0 records until StopRecording().
     bool  StartRecording(const std::string& title, int fps, float lengthSeconds);
     void  StopRecording()                { vk.StopRecording(); }
     bool  IsRecording()            const { return vk.IsRecording(); }
     float RecordedSeconds()        const { return vk.RecordedSeconds(); }
-    // See VulkanContext::SetCaptureFromSwapchain — must be set false while batch rendering so the
-    // per-tick overlay-refresh RenderFrame() call doesn't splice blank frames into the video.
+    // See VulkanContext::SetCaptureFromSwapchain.
     void  SetCaptureFromSwapchain(bool enable) { vk.SetCaptureFromSwapchain(enable); }
-    // See VulkanContext::RenderOffscreenFrame — draws+captures a video frame with no swapchain or
-    // window involvement at all, so a batch render can't be throttled by vsync or by the window
-    // being occluded/backgrounded.
+    // See VulkanContext::RenderOffscreenFrame.
     void  RenderOffscreenFrame()         { vk.RenderOffscreenFrame(); }
 
 private:

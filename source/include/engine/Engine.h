@@ -9,7 +9,6 @@ extern std::vector<Object> objects;
 
 // Object management
 Object& CreateObject(float x, float y, Renderable r);
-void    RemoveObject(size_t i);
 
 // Screen dimensions (available after Init)
 float ScreenHalfWidth();

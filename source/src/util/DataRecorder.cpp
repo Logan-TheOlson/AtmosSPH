@@ -31,7 +31,7 @@ void DataRecorder::SubmitFrame(int frame, float time, std::vector<ParticleSample
     if (!file_.is_open()) return;
 
     std::lock_guard<std::mutex> lock(queueMutex_);
-    if (queue_.size() >= kMaxQueuedFrames) return; // writer can't keep up — drop this frame's samples rather than stall the sim
+    if (queue_.size() >= kMaxQueuedFrames) return; // writer can't keep up: drop the frame
 
     queue_.push_back({ frame, time, std::move(samples) });
     queueCv_.notify_one();
@@ -47,8 +47,7 @@ void DataRecorder::WriterLoop() {
             job = std::move(queue_.front());
             queue_.pop_front();
         }
-        // Formatting (potentially tens of thousands of rows) happens here, off the caller's
-        // thread — that's the whole point of this queue.
+        // Formatting happens here, off the caller's thread.
         WriteJob(job);
     }
 }
@@ -76,7 +75,7 @@ void DataRecorder::Stop() {
         stopping_ = true;
     }
     queueCv_.notify_all();
-    if (worker_.joinable()) worker_.join(); // drains whatever is still queued before we close the file
+    if (worker_.joinable()) worker_.join(); // drains the queue before the file closes
 
     file_.close();
     queue_.clear();

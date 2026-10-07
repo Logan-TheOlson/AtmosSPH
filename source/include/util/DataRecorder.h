@@ -7,10 +7,8 @@
 #include <thread>
 #include <vector>
 
-// One particle's sampled state for a single CSV row. Always fully populated by the caller;
-// DataRecorder decides which columns actually get written based on the Fields selected at
-// Start() — trades a few unused floats per sample for a caller that doesn't need to know which
-// columns are active.
+// One particle's sampled state for a CSV row. Always fully populated; DataRecorder writes only
+// the columns selected in Fields at Start().
 struct ParticleSample {
     float x, y;
     float vx, vy;
@@ -19,12 +17,9 @@ struct ParticleSample {
     float pressure;
 };
 
-// Buffers particle-field CSV rows off the sim thread, mirroring Recorder's queue/worker-thread
-// shape (see util/Recorder.h): SubmitFrame() only queues a job and returns, a background thread
-// does the formatting and disk write. Unlike Recorder there's no external process and no
-// caller-owned buffer to release — each Job owns its own copy of the frame's samples via
-// std::move — so backpressure just means dropping the frame's samples on the floor rather than
-// calling anything back.
+// Writes particle-field CSV rows off the sim thread, like Recorder: SubmitFrame() queues a job and
+// a background thread formats and writes it. Each Job owns its samples, so when the queue is full
+// the frame is simply dropped.
 class DataRecorder {
 public:
     struct Fields {

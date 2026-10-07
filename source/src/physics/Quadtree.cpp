@@ -12,9 +12,8 @@ std::vector<QuadNode>  nodes;
 std::vector<int32_t>   particleIndex;
 
 namespace {
-    // Below this half-size, stop subdividing even if a leaf is over-full
-    // (guards against unbounded recursion on coincident/near-coincident
-    // particle positions).
+    // Below this half-size, stop subdividing even if a leaf is over-full (guards against
+    // coincident particles).
     constexpr float MinHalfSize = 0.01f;
 
     std::vector<int32_t> scratch;
@@ -48,15 +47,13 @@ void BuildQuadtree(const std::vector<Vec2>& pos, int32_t n) {
 
     scratch.resize(n);
 
-    // BFS by level: [levelBegin, levelEnd) is the current level's node range.
-    // Children are always appended past levelEnd, so this never touches a
-    // node created during the same pass.
+    // BFS by level: [levelBegin, levelEnd) is the current level's node range; children are
+    // appended past levelEnd.
     int32_t levelBegin = 0;
     int32_t levelEnd   = static_cast<int32_t>(nodes.size());
     int32_t level      = 0;
-    // A hard depth cap: with non-finite positions halfSize is NaN, the MinHalfSize test never
-    // fires, and the tree would otherwise grow until memory runs out. Also keeps the traversal's
-    // fixed-size stack safe (depth * 3 pending siblings + 1 must stay under it).
+    // Hard depth cap: with non-finite positions halfSize is NaN and the MinHalfSize test never
+    // fires. Also keeps the traversal's fixed-size stack safe (depth * 3 pending siblings + 1).
     constexpr int32_t MaxLevels = 64;
     while (levelBegin < levelEnd && level++ < MaxLevels) {
         for (int32_t ni = levelBegin; ni < levelEnd; ni++) {
@@ -105,9 +102,8 @@ void ComputeMoments(const std::vector<Vec2>& pos) {
     const float mass = params.particleMass;
     const int32_t nodeCount = static_cast<int32_t>(nodes.size());
 
-    // Leaves only read `pos`/`particleIndex` and each writes its own node, so they're
-    // datarace-free across threads — unlike internal nodes below, they don't depend on any
-    // other node having been processed yet, so this pass can run before/independent of that scan.
+    // Leaves only read `pos`/`particleIndex` and each writes its own node, so this pass is
+    // datarace-free across threads.
     ParallelFor(nodeCount, [&](int32_t begin, int32_t end) {
         for (int32_t ni = begin; ni < end; ni++) {
             QuadNode& node = nodes[ni];
@@ -132,10 +128,8 @@ void ComputeMoments(const std::vector<Vec2>& pos) {
         }
     });
 
-    // Children always have a larger index than their parent (see BuildQuadtree), so a reverse
-    // scan is a valid bottom-up order. Leaves were already filled in above; only internal nodes
-    // (whose children — leaf or internal — are guaranteed done by the time we reach them) are
-    // computed here, serially, since each depends on the last.
+    // Children always have a larger index than their parent, so a reverse scan is bottom-up.
+    // Leaves are done above; internal nodes are computed here serially.
     for (int32_t ni = nodeCount - 1; ni >= 0; ni--) {
         QuadNode& node = nodes[ni];
         if (node.childStart < 0) continue;
@@ -156,8 +150,7 @@ void ComputeMoments(const std::vector<Vec2>& pos) {
             if (child.mass <= 0.f) continue;
             const Vec2  d  = child.centerOfMass - node.centerOfMass;
             const float r2 = dot(d, d);
-            // Parallel-axis shift of the child's own quadrupole to the parent's COM,
-            // plus the point-mass contribution of the child treated as concentrated at its COM.
+            // Parallel-axis shift of the child's quadrupole to the parent's COM, plus the child as a point mass.
             qxx += child.qxx + child.mass * (3.f * d.x * d.x - r2);
             qxy += child.qxy + child.mass * (3.f * d.x * d.y);
             qyy += child.qyy + child.mass * (3.f * d.y * d.y - r2);

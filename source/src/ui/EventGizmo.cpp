@@ -10,9 +10,8 @@ namespace {
     enum class Drag { None, Create, Move, Resize, Arrow };
 
     // Resize handles sit on each side (and, for rects, each corner) of an area's bounding box.
-    // Dragging one moves just that side/corner while the opposite one stays put (hold Alt to
-    // resize symmetrically about the center instead). A circle is edited through its bounding
-    // square, so only the four side handles apply and the radius is half the resulting span.
+    // Dragging one moves that side/corner while the opposite stays put (Alt resizes about the
+    // center). A circle is edited through its bounding square: only the side handles apply.
     enum class Handle { None, E, W, N, S, NE, NW, SE, SW };
 
     struct State {
@@ -89,9 +88,8 @@ namespace {
         }
     }
 
-    // Moves the dragged side/corner to the mouse (world coords), keeping the opposite one fixed
-    // (or mirroring about the center with `symmetric`), with a minimum span so an area can't be
-    // dragged inside out or to nothing.
+    // Moves the dragged side/corner to the mouse, keeping the opposite one fixed (or mirroring
+    // about the center with `symmetric`), with a minimum span.
     void ApplyHandleDrag(SceneEvent& e, Handle h, float mx, float my, bool symmetric) {
         constexpr float MinHalf = 4.f;
         float left = e.cx - HalfW(e), right = e.cx + HalfW(e);
@@ -113,7 +111,7 @@ namespace {
         }
 
         if (e.shape == EventShape::Circle) {
-            // Bounding-square model: the dragged axis sets the diameter, the other axis follows.
+            // The dragged axis sets the diameter; the other follows.
             const bool horizontal = moveE || moveW;
             const float span = horizontal ? right - left : top - bottom;
             e.radius = span * 0.5f;
@@ -231,8 +229,7 @@ Result Update(const Context& ctx) {
             }
         }
         if (hit == Hit::None) {
-            // Topmost (last-created) area under the cursor wins; the selected one is tried first so
-            // overlapping areas stay grabbable.
+            // The topmost (last-created) area wins; the selected one is tried first.
             if (selected >= 0 && Inside(events[selected], mwx, mwy)) { hit = Hit::Body; hitIndex = selected; }
             else for (int i = static_cast<int>(events.size()) - 1; i >= 0; i--)
                 if (Inside(events[i], mwx, mwy)) { hit = Hit::Body; hitIndex = i; break; }
@@ -346,7 +343,7 @@ Result Update(const Context& ctx) {
                 }
         }
 
-        // Push direction/strength arrow, always shown (it is the event's whole point).
+        // Push direction/strength arrow.
         float tx, ty;
         ArrowTip(e, tx, ty);
         const bool aimed = HasArrow(ctx, e) && (e.accel.x != 0.f || e.accel.y != 0.f);

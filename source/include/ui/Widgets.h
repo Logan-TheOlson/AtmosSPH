@@ -11,8 +11,7 @@ namespace Widgets {
         const ImVec2 pad(10.f, 3.f);
         const ImVec2 ts  = ImGui::CalcTextSize(text);
         const ImVec2 size(ts.x + pad.x * 2.f, ts.y + pad.y * 2.f);
-        // Occupies a full frame-height cell (so it lines up with buttons beside it) and is drawn
-        // vertically centered inside it.
+        // Occupies a full frame-height cell so it lines up with neighboring buttons.
         const float  cell = std::max(size.y, ImGui::GetFrameHeight());
         ImVec2 pos = ImGui::GetCursorScreenPos();
         pos.y += (cell - size.y) * 0.5f;

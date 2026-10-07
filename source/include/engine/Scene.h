@@ -6,29 +6,22 @@
 #include <string>
 #include <vector>
 
-// Simulation container half-extents, as a fraction of the window's half-extents (1.0 = walls at
-// the window edge). Kept relative rather than absolute so presets don't hardcode window pixels.
+// Simulation container half-extents, as a fraction of the window's half-extents.
 struct SceneBoundary {
     float widthFrac  = 1.0f;
     float heightFrac = 1.0f;
-    // Absolute half-extents in simulation pixels. When > 0, each overrides its *Frac above, so
-    // the container no longer depends on the window size or on whether a recording (with its own
-    // fixed resolution) is active. Scenes whose geometry is part of the physics — e.g. the
-    // Poiseuille channel height H, which sets the analytic profile — size the box from their own
-    // particle grid this way instead of from a window fraction.
+    // Absolute half-extents in simulation pixels. When > 0, each overrides its *Frac above, making
+    // the container independent of window size and recording resolution.
     float halfWidthPx  = 0.f;
     float halfHeightPx = 0.f;
-    // If set, the left/right walls don't bounce particles — a particle crossing one teleports to
-    // the other side instead (position only; velocity untouched), simulating an infinite domain
-    // for a channel-flow test. main.cpp mirrors real particles across the seam too (see
-    // ForEachPeriodicX) so density/pressure near the seam are computed as if particles from the
-    // opposite edge really are nearby, matching what an infinite domain would give.
+    // If set, a particle crossing the left/right wall teleports to the other side (velocity
+    // untouched) instead of bouncing. main.cpp also mirrors particles across the seam (see
+    // ForEachPeriodicX) so density/pressure near it match an infinite domain.
     bool  periodicX  = false;
 };
 
 struct ScenePhysics {
-    // Constant acceleration applied to every particle every frame (pixels/s^2) — gravity is just
-    // the common case of this pointing down; a horizontal force drives channel-flow tests instead.
+    // Constant acceleration applied to every particle (px/s^2).
     Vec2  force          = Vec2(0.f, -600.f);
     float restitution   = 0.85f;
     // Fraction of tangential velocity removed on wall contact when noSlipWalls is enabled.
@@ -38,16 +31,12 @@ struct ScenePhysics {
     int   forceInterval  = 1;
 };
 
-// BarnesHut implements the 3D Newtonian (1/r^2) law restricted to the simulation plane (see
-// Quadtree.h's QuadNode comment); Genuine2D instead implements the softened log-potential (1/r)
-// law a real 2D universe's Poisson equation gives (see Gravity.cpp's EvaluateForce2D) —
-// physically correct for a simulation that's actually 2D, and the default for that reason.
+// BarnesHut: the 3D Newtonian (1/r^2) law restricted to the simulation plane (see Quadtree.h).
+// Genuine2D: the softened log-potential (1/r force) law of a true 2D universe (see Gravity.cpp's
+// EvaluateForce2D); the default.
 enum class GravityMethod { BarnesHut, Genuine2D };
 
-// Self-gravity between particles, layered on top of ScenePhysics::force. Off by default — most
-// scenes (channel flow, open tank) want only the constant external force, not an N-body pull.
-// method/parameters are per-scene so, e.g., a stellar-formation preset can run at its own tuned
-// G/softening while another scene keeps gravity off entirely.
+// Self-gravity between particles, layered on top of ScenePhysics::force. Off by default.
 struct SceneGravity {
     bool          enabled          = false;
     GravityMethod method           = GravityMethod::Genuine2D;
@@ -59,28 +48,22 @@ struct SceneGravity {
     bool          validate         = false; // periodically compares the active method against brute-force on a small sample
 };
 
-// Which pressure-from-density law main.cpp's CalculatePressure applies. Per-scene, since a scene
-// meant to match a known analytical equilibrium (e.g. Self-Gravity vs. Lane-Emden) wants the pure
-// polytrope, while the fluid scenes want WCSPH's stiffness against a specific rest density.
+// Which pressure-from-density law main.cpp's CalculatePressure applies.
 enum class EosModel {
     // Becker-Teschner weakly-compressible SPH: pressure = stiffness*targetDensity/exponent *
-    // ((density/targetDensity)^exponent - 1), clamped to >=0. Only approximates a pure polytrope
-    // once density >> targetDensity; the -1 offset matters close to targetDensity.
+    // ((density/targetDensity)^exponent - 1), clamped to >=0.
     WCSPH,
-    // Pure polytrope: pressure = stiffness * density^(1 + 1/polytropicIndex), no targetDensity
-    // offset — the equation of state a Lane-Emden equilibrium is derived against.
+    // Pure polytrope: pressure = stiffness * density^(1 + 1/polytropicIndex), no targetDensity offset.
     Polytropic,
 };
 
 // Which viscous force main.cpp's CalculatePressureForce applies between particle pairs.
 enum class ViscosityModel {
-    // Monaghan artificial viscosity: a pressure-like term along the pair axis, active only for
-    // approaching pairs, strength set by `viscosity` (alpha) and `viscosityQuadratic` (beta).
-    // Its effective kinematic viscosity (~alpha*h*c/8 in 2D) is not an input — it has to be
-    // measured, and it scales with h.
+    // Monaghan artificial viscosity: a pressure-like term along the pair axis for approaching
+    // pairs, set by `viscosity` (alpha) and `viscosityQuadratic` (beta). The effective kinematic
+    // viscosity (~alpha*h*c/8 in 2D) is not an input and scales with h.
     Monaghan,
-    // Morris, Fox & Zhu (1997) physical viscosity: a discretised nu * laplacian(v) acting on the
-    // full relative velocity of every pair, with nu = `kinematicViscosity` set directly.
+    // Morris, Fox & Zhu (1997) physical viscosity: nu * laplacian(v) with nu = `kinematicViscosity`.
     Morris,
 };
 
@@ -88,14 +71,11 @@ struct SceneParticles {
     float circleRadius = 3.0f;
     Color circleColor  = { 0.2f, 0.6f, 1.0f, 1.0f };
 
-    // Calibrated to smoothingRadius=15 and a grid spacing of circleRadius*3=9px — recompute
-    // (lattice-sum the Poly6 kernel at the new spacing/radius) if either changes.
+    // Calibrated to smoothingRadius=15 and a grid spacing of circleRadius*3=9px; recompute
+    // targetDensity (lattice-sum the Poly6 kernel) if either changes.
     float smoothingRadius    = 15.0f;
-    // 6.48e-4 was the lattice sum against the OLD 3D Poly6 normalization (315/(64*pi*h^9)).
-    // DensityKernel's shape, (h^2-r^2)^3, didn't change — only main.cpp's DensityNorm prefactor
-    // did, to the true 2D normalization (4/(pi*h^8)) — so this is corrected by the exact ratio
-    // newNorm/oldNorm = 256*h/315 at this struct's own h=15 (256*15/315 = 12.190476...), not
-    // re-derived from scratch.
+    // 6.48e-4 is the lattice sum under the old 3D Poly6 normalization; the factor converts it to
+    // the 2D normalization (4/(pi*h^8)) at h=15.
     float targetDensity      = 6.48e-4f * (256.f * 15.f / 315.f); // = 7.8994...e-3
     float stiffness          = 12000.f;
 
@@ -106,38 +86,33 @@ struct SceneParticles {
     ViscosityModel viscosityModel = ViscosityModel::Monaghan;
 
     float viscosity          = 0.5f;  // Monaghan only (alpha)
-    // Monaghan artificial viscosity quadratic-term coefficient (beta) — see main.cpp's
-    // CalculatePressureForce for why this must stay well under 1. Monaghan only.
+    // Quadratic-term coefficient (beta); must stay well under 1 (see CalculatePressureForce). Monaghan only.
     float viscosityQuadratic = 0.05f;
     // Kinematic viscosity nu in px^2/s. Morris only.
     float kinematicViscosity = 800.f;
 };
 
-// How Init() lays out the starting particles: a gridCountX x gridCountY block (or, if `circular`,
-// a circle inscribed in a block of that size) of spacing-separated particles, centered vertically
-// and horizontally offset by offsetXFrac * the boundary's half-width.
+// How Init() lays out the starting particles for a scene without groups: a gridCountX x gridCountY
+// block (or a circle inscribed in it), centered vertically and offset horizontally by
+// offsetXFrac * the boundary's half-width.
 struct SceneSpawn {
     int   gridCountX  = 100;
     int   gridCountY  = 100;
     float offsetXFrac = 0.0f;
     bool  circular     = false;
-    // If set, Init() ignores gridCountX/Y and packs the lattice wall to wall into the boundary
-    // (whatever its size resolves to), writing the resulting counts back into gridCountX/Y.
+    // If set, Init() packs the lattice wall to wall and writes the resulting counts back into gridCountX/Y.
     bool  fillBoundary = false;
-    // Lattice spacing as a multiple of the default (3 * circleRadius). < 1 packs more particles into
-    // the same area than the rest density calls for, i.e. starts the fluid compressed (positive
-    // pressure); the particle count rises by 1 / spacingScale^2.
+    // Lattice spacing as a multiple of the default (3 * circleRadius). < 1 starts the fluid
+    // compressed; the particle count rises by 1 / spacingScale^2.
     float spacingScale = 1.f;
 };
 
-// A sudden acceleration applied to every particle inside an area. Circle/Rect pick the area's
-// shape; Continuous applies `accel` (px/s^2) every substep while the event is active, Once adds
-// `accel` (px/s) to the velocity of everything inside, a single time, when startTime is reached.
+// An acceleration applied to every particle inside an area. Continuous applies `accel` (px/s^2)
+// every substep while active; Once adds `accel` (px/s) to the velocity once, at startTime.
 enum class EventShape { Circle, Rect };
-// Field: a continuous position-dependent acceleration (see EventFieldAccel) instead of one uniform push.
+// Field: a position-dependent acceleration (see EventFieldAccel) instead of a uniform push.
 enum class EventMode  { Continuous, Once, Field };
-// Field shapes: Curl swirls counter-clockwise around the area's center (negative strength = clockwise),
-// Attract pulls toward it, Repel pushes away.
+// Curl swirls counter-clockwise around the area's center (negative strength = clockwise).
 enum class FieldKind  { Curl, Attract, Repel };
 
 struct SceneEvent {
@@ -155,8 +130,7 @@ struct SceneEvent {
     bool  fade      = false;             // Field only: full strength at the center, falling to 0 at the edge
 };
 
-// Field acceleration at world point (px, py) for a Field-mode event; false if the point is outside
-// the area. Zero exactly at the center (direction undefined there).
+// Field acceleration at (px, py) for a Field-mode event; false if outside the area. Zero at the center.
 inline bool EventFieldAccel(const SceneEvent& e, float px, float py, float& ax, float& ay) {
     const float dx = px - e.cx, dy = py - e.cy;
     float edge; // 0 at the center -> 1 at the boundary
@@ -181,9 +155,8 @@ inline bool EventFieldAccel(const SceneEvent& e, float px, float py, float& ax, 
     return true;
 }
 
-// A persistent-color patch: every particle whose *spawn* position lies inside the area keeps `color`
-// for the whole run unless a live color-by mode (Engine.cpp) overrides it. Coordinates
-// are world pixels (origin = window center, +y up), same as SceneEvent. Later regions win overlaps.
+// A persistent-color patch: particles spawned inside it keep `color` for the run unless a live
+// color-by mode overrides it. World pixels, as SceneEvent. Later regions win overlaps.
 struct SceneColorRegion {
     EventShape shape = EventShape::Rect;
     float cx = 0.f, cy = 0.f;
@@ -192,9 +165,8 @@ struct SceneColorRegion {
     Color color = { 1.f, 0.3f, 0.2f, 1.f };
 };
 
-// A solid obstacle: no particle spawns inside it (Init), and during the run it is a wall particles
-// bounce off (Integrate) and mirror-image across for SPH density (main.cpp's ForEachObstacleGhost).
-// Coordinates are world pixels (origin = window center, +y up), same as SceneEvent.
+// A solid obstacle: nothing spawns inside it, particles bounce off it, and it mirrors particles
+// for SPH density (main.cpp's ForEachObstacleGhost). World pixels, as SceneEvent.
 struct SceneObstacle {
     EventShape shape = EventShape::Circle;
     float cx = 0.f, cy = 0.f;
@@ -204,8 +176,7 @@ struct SceneObstacle {
 };
 
 // Signed distance from (x, y) to the obstacle's surface (negative inside) and the outward unit
-// normal there. Outside a rect's corner the normal points diagonally (a rounded corner of any
-// margin); inside, it is the axis of the nearest face. Callers treat `sd < margin` as touching.
+// normal. Callers treat `sd < margin` as touching.
 inline float ObstacleSurface(const SceneObstacle& o, float x, float y, float& nx, float& ny) {
     const float dx = x - o.cx, dy = y - o.cy;
     if (o.shape == EventShape::Circle) {
@@ -236,14 +207,13 @@ inline bool InsideAnyObstacle(const std::vector<SceneObstacle>& obstacles, float
 
 // A block of starting particles: a square lattice filling a rect, or a Fibonacci-spiral disk for a
 // circle, at spacing 3 * circleRadius * spacingScale. A Scene with `useGroups` spawns exactly its
-// groups (none = an empty scene); without it, Init() derives one group from SceneSpawn instead
-// (SpawnBlockAsGroup). Coordinates are world pixels (origin = window center, +y up).
+// groups; otherwise Init() derives one from SceneSpawn (SpawnBlockAsGroup). World pixels.
 struct SceneGroup {
     EventShape shape = EventShape::Rect;
     float cx = 0.f, cy = 0.f;
     float radius = 100.f;                // Circle
     float halfW = 100.f, halfH = 100.f;  // Rect
-    float spacingScale = 1.f;            // < 1 packs tighter (starts compressed), like SceneSpawn::spacingScale
+    float spacingScale = 1.f;            // < 1 packs tighter, like SceneSpawn::spacingScale
     bool  customColor = false;           // false: the scene's particle color (particles.circleColor)
     Color color = { 0.2f, 0.6f, 1.0f, 1.0f };
 };
@@ -278,8 +248,8 @@ inline int GroupParticleCount(const SceneGroup& g, float spacing) {
     return nx * ny;
 }
 
-// Resizes the group (keeping its center, shape and a rect's aspect ratio) so that at `spacing` it
-// holds about `count` particles — more particles means a bigger block, not a denser one.
+// Resizes the group (keeping center, shape and a rect's aspect ratio) to hold about `count`
+// particles at `spacing`.
 inline void ResizeGroupToCount(SceneGroup& g, float spacing, int count) {
     if (!(spacing > 0.f)) return;
     count = std::clamp(count, 1, MaxSpawnParticles);
@@ -293,14 +263,11 @@ inline void ResizeGroupToCount(SceneGroup& g, float spacing, int count) {
     }
 }
 
-// Calls fn(x, y) for every particle position of the group at `spacing` (the UI preview passes a
-// coarser spacing to sample the same shape cheaply).
+// Calls fn(x, y) for every particle position of the group at `spacing`.
 template <typename Fn>
 inline void ForEachGroupPoint(const SceneGroup& g, float spacing, Fn&& fn) {
     if (g.shape == EventShape::Circle) {
-        // Exactly `count` particles in a disk of areal density 1 / spacing^2: a Fibonacci
-        // ("sunflower"/Vogel) spiral, not a square lattice masked by a circle (which only
-        // approximates the count).
+        // Fibonacci (Vogel) spiral: exactly `count` particles at areal density 1 / spacing^2.
         const int   count = GroupCircleCount(g, spacing);
         constexpr float GoldenAngle = 2.39996323f; // pi * (3 - sqrt(5))
         for (int i = 0; i < count; i++) {
@@ -319,18 +286,14 @@ inline void ForEachGroupPoint(const SceneGroup& g, float spacing, Fn&& fn) {
             fn(startX + static_cast<float>(x) * spacing, startY + static_cast<float>(y) * spacing);
 }
 
-// Blend mode for SceneColorRegions (and, via PatternSampler, the stripe/checker/ring patterns). Two parts:
-//  * Color: a gradient between the areas' *centers* -- each area's weight is its reach / (distance to its center),
-//    which for two areas is a straight linear lerp along the line joining them (pure color at each center),
-//    like the Gradient pattern. Overlaps are not stacked: where areas overlap, only the topmost (last in
-//    the list) takes part, the ones it covers are ignored there.
-//  * Coverage: that color is solid within the areas' footprint and ramps linearly back to `out` (which must
-//    hold the color the point would otherwise have, i.e. base/pattern) over a band beyond the edge.
-// `strength` (0..1) is how far the gradient replaces the area's own flat color inside it, and how much
-// of the fade beyond the edge is applied (0 = hard-edged patches). `radius` (px) is the width of that band;
-// <= 0 = automatic (50% of the area's smaller half-size). Each area's reach is independent of the others;
-// the gradient between areas appears where their reaches overlap.
-// Returns false (out untouched) for points no area reaches.
+// Blends SceneColorRegions into `out` (which must hold the color the point would otherwise have).
+//  * Color: a gradient between the areas' centers, each weighted by reach / distance-to-center.
+//    Where areas overlap, only the topmost (last) takes part.
+//  * Coverage: that color is solid inside the areas' footprint and fades linearly back to `out`
+//    over a band beyond the edge.
+// `strength` (0..1) scales how far the gradient replaces an area's flat color and how much of the
+// edge fade applies (0 = hard-edged patches). `radius` (px) is the band width; <= 0 = 50% of the
+// area's smaller half-size. Returns false (out untouched) for points no area reaches.
 inline bool BlendColorRegions(const std::vector<SceneColorRegion>& regions, float x, float y, Color& out,
                               float strength = 1.f, float radius = 0.f) {
     auto edgeDist = [&](const SceneColorRegion& r, float& size) {
@@ -378,8 +341,7 @@ inline bool BlendColorRegions(const std::vector<SceneColorRegion>& regions, floa
     return true;
 }
 
-// A persistent-color pattern laid over the whole spawn block (before SceneColorRegions, which win where
-// they overlap). Like regions, colors are assigned at spawn and never change during the run.
+// A persistent-color pattern laid over the spawn block; SceneColorRegions win where they overlap.
 enum class ColorPatternKind { None, VStripes, HStripes, Checker, Rings, Gradient, Image };
 
 struct SceneColorPattern {
@@ -387,13 +349,10 @@ struct SceneColorPattern {
     Color colorA = { 1.f, 0.35f, 0.25f, 1.f };
     Color colorB = { 0.25f, 0.55f, 1.f, 1.f };
     float cellSize = 60.f;       // px: stripe width / checker cell / ring spacing (unused by Gradient/Image)
-    std::string imagePath;       // Image: PNG/BMP, scaled to fit the spawn block (aspect kept); transparent pixels stay unpinned
+    std::string imagePath;       // Image: PNG/BMP scaled to fit the spawn block; transparent pixels are left uncolored
 };
 
 struct Scene {
-    // Owned (not a pointer into a string literal) so a preset loaded from disk at runtime
-    // (ScenePresetIO) can populate these safely — only the 3 compiled presets get away with a
-    // literal today, but a loaded Scene needs storage of its own.
     std::string     name;
     std::string     description;
     SceneBoundary   boundary;
@@ -402,10 +361,8 @@ struct Scene {
     SceneParticles  particles;
     SceneSpawn      spawn;
 
-    // Real-Time Limit: hand-tuned grid size this scene stays smooth/stable at in real time on
-    // the developer's own machine — not measured by the sim itself, just shown for reference in
-    // the menu (Engine.cpp's DrawMenu). Independent of spawn.gridCountX/Y (the scene's own
-    // default count), since BuildScene() only overrides the latter.
+    // Hand-tuned grid size this scene runs smoothly at in real time; shown for reference in the
+    // menu only. Independent of spawn.gridCountX/Y.
     int             realTimeLimitX = 0;
     int             realTimeLimitY = 0;
 
@@ -422,27 +379,20 @@ struct Scene {
 
 extern const std::vector<Scene> ScenePresets;
 
-// Rebuilds ScenePresets[presetIndex] with its particle grid resized to gridCountX x gridCountY
-// instead of the preset's own default count — re-deriving whatever calibration depends on that
-// count (e.g. MakeSelfGravity's mass/softening/stiffness scaling), not just overwriting
-// SceneSpawn's fields on a copy, which would leave a resolution-dependent scene tuned for the
-// wrong count. gridCountX/Y are clamped to >= 1.
+// Rebuilds ScenePresets[presetIndex] with its grid resized to gridCountX x gridCountY (clamped to
+// >= 1), re-deriving any count-dependent calibration.
 Scene BuildScene(int presetIndex, int gridCountX, int gridCountY);
 
-// The legacy SceneSpawn block (grid counts, circular, offset, packing, fillBoundary) expressed as a
-// SceneGroup inside a container of the given half-extents. Clamps and writes the resulting grid
-// counts back into scene.spawn (fillBoundary derives them from the container). This is what Init()
-// spawns for a scene without groups, and what the menu seeds its editable groups from.
+// The SceneSpawn block expressed as a SceneGroup inside a container of the given half-extents.
+// Clamps and writes the resulting grid counts back into scene.spawn.
 SceneGroup SpawnBlockAsGroup(Scene& scene, float halfWidth, float halfHeight);
 
 // Total particles the scene will spawn (before obstacle culling), from its groups if it has them.
 int SceneParticleCount(const Scene& scene);
 
-// The scene currently governing physics/spawn/boundary. Mutable — set via LoadScene(), not
-// assigned directly, so derived SPH kernel constants (main.cpp's RecomputeSphConstants) stay in
-// sync with it.
+// The scene currently governing physics/spawn/boundary. Set via LoadScene(), not assigned
+// directly, so the derived SPH constants stay in sync.
 extern Scene ActiveScene;
 
-// Recomputes cached kernel constants (main.cpp) from `scene`'s particle settings. Does not spawn
-// particles — call Init() after, once `objects` has been reset.
+// Makes `scene` active and recomputes cached kernel constants. Does not spawn; call Init() after.
 void LoadScene(const Scene& scene);

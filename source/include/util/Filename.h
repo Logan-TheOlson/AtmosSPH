@@ -3,10 +3,8 @@
 #include <string>
 #include <string_view>
 
-// Strips anything unsafe to use both as a filename and inside the double-quoted ffmpeg command
-// line Recorder builds (rejects quotes in particular, which could otherwise break out of the
-// quoted output path). Shared by App::StartRecording and Engine.cpp's data-save path so both
-// agree on what's safe.
+// Strips anything unsafe in a filename or inside the double-quoted ffmpeg command line Recorder
+// builds (quotes in particular).
 inline std::string SanitizeFilename(std::string_view raw, const char* fallback) {
     std::string safe;
     for (char c : raw)

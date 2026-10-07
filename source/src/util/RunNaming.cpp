@@ -5,8 +5,7 @@
 
 namespace RunNaming {
 namespace {
-    // %g already trims trailing zeros (20.0f -> "20", 19.5f -> "19.5"), which is what makes the
-    // generated filenames compact instead of "g20.000000".
+    // %g trims trailing zeros (20.0f -> "20"), keeping filenames compact.
     std::string FormatCompact(float v) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%g", v);
@@ -65,7 +64,7 @@ std::string EnsureUniqueBaseName(const std::string& baseName, const std::vector<
         std::string candidate = baseName + "_" + std::to_string(suffix);
         if (!anyExists(candidate)) return candidate;
     }
-    return baseName; // pathological fallback: give up disambiguating past 10000 collisions
+    return baseName; // give up disambiguating past 10000 collisions
 }
 
 } // namespace RunNaming

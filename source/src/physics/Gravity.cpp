@@ -9,11 +9,9 @@
 namespace Gravity {
 
 namespace {
-    // Cached, not read from `params` per-call — recomputed only when SetParams() runs (once per
-    // scene load), mirroring main.cpp's RecomputeSphConstants() for the SPH kernel constants.
+    // Cached from `params`; recomputed only when SetParams() runs.
     float G       = 20.f;
-    // 2D Gauss's law gives g(r) = 2*G*M/r for the enclosed mass (vs. 3D's G*M/r^2) — cached
-    // alongside G so EvaluateForce2D/DirectSumGravity2D don't pay a multiply-by-2 per pair.
+    // 2D Gauss's law gives g(r) = 2*G*M/r (vs. 3D's G*M/r^2); cached to skip a multiply per pair.
     float TwoG    = 40.f;
     float Mass    = 1.f;
     float Eps2    = 0.f;
@@ -52,8 +50,7 @@ Vec2 EvaluateForce(int32_t selfIdx, const std::vector<Vec2>& pos) {
         const float r2   = dot(diff, diff);
         const bool  isLeaf = node.childStart < 0;
 
-        // MAC: treat this node as a single mass if it's a leaf, or if it's
-        // far enough away relative to its size ((2*halfSize)/dist < theta).
+        // MAC: treat the node as a single mass if it's a leaf or far enough away ((2*halfSize)/dist < theta).
         if (isLeaf || (4.f * node.halfSize * node.halfSize) < ThetaSq * r2) {
             if (isLeaf) {
                 for (int32_t k = 0; k < node.particleCount; k++) {
@@ -71,9 +68,8 @@ Vec2 EvaluateForce(int32_t selfIdx, const std::vector<Vec2>& pos) {
                 const float invR3 = 1.f / (r2s * r);
                 accel -= (G * node.mass) * diff * invR3;
 
-                // Quadrupole correction (standard 3D multipole term with the
-                // z-component dropped, since every particle and query point
-                // lies in the z=0 plane — see Quadtree.h for why qyy != -qxx).
+                // Quadrupole correction: the 3D multipole term with z dropped (everything is in
+                // the z=0 plane; see Quadtree.h for why qyy != -qxx).
                 const float invR5 = invR3 / r2s;
                 const float invR7 = invR5 / r2s;
                 const Vec2  QR(node.qxx * diff.x + node.qxy * diff.y,
@@ -89,13 +85,10 @@ Vec2 EvaluateForce(int32_t selfIdx, const std::vector<Vec2>& pos) {
     return accel;
 }
 
-// A real 2D universe's Poisson equation (nabla^2 phi = 4*pi*G*Sigma -- the 2D Green's function
-// (1/2pi)ln(r) already carries the 2pi, so a point mass's potential G*m*ln(r^2) integrates back to
-// the same 4*pi*G*Sigma as 3D's nabla^2 phi = 4*pi*G*rho, not 2*pi*G) gives a softened log
-// potential phi(r) = G*m*ln(r^2 + eps^2) and force -grad(phi) = -2*G*m*d/(r^2+eps^2)
-// — a 1/r force, not EvaluateForce()'s 1/r^2 (which is just the 3D law restricted to the z=0
-// plane, see Quadtree.h). Monopole-only: unlike EvaluateForce(), there's no quadrupole
-// correction here — QuadNode's qxx/qxy/qyy tensor is derived for the 1/r^2 law specifically.
+// A real 2D universe's Poisson equation (nabla^2 phi = 4*pi*G*Sigma) gives the softened log
+// potential phi(r) = G*m*ln(r^2 + eps^2) and force -grad(phi) = -2*G*m*d/(r^2+eps^2): a 1/r
+// force, not EvaluateForce()'s 1/r^2. Monopole-only, since QuadNode's quadrupole tensor is
+// derived for the 1/r^2 law.
 Vec2 EvaluateForce2D(int32_t selfIdx, const std::vector<Vec2>& pos) {
     const Vec2 p = pos[selfIdx];
     Vec2 accel(0.f, 0.f);
@@ -114,8 +107,7 @@ Vec2 EvaluateForce2D(int32_t selfIdx, const std::vector<Vec2>& pos) {
         const float r2   = dot(diff, diff);
         const bool  isLeaf = node.childStart < 0;
 
-        // Same MAC as EvaluateForce() — node acceptance is purely tree geometry, independent of
-        // which force law is being evaluated.
+        // Same MAC as EvaluateForce(): acceptance depends only on tree geometry.
         if (isLeaf || (4.f * node.halfSize * node.halfSize) < ThetaSq * r2) {
             if (isLeaf) {
                 for (int32_t k = 0; k < node.particleCount; k++) {
@@ -168,30 +160,6 @@ Vec2 DirectSumGravity2D(int32_t selfIdx, const std::vector<Vec2>& pos, int32_t n
     }
 
     return accel;
-}
-
-float DirectSumPotentialEnergy(const std::vector<Vec2>& pos, int32_t n) {
-    float pe = 0.f;
-    for (int32_t i = 0; i < n; i++) {
-        for (int32_t j = i + 1; j < n; j++) {
-            const Vec2  d   = pos[i] - pos[j];
-            const float rr2 = dot(d, d) + Eps2;
-            pe -= (G * Mass * Mass) / std::sqrt(rr2);
-        }
-    }
-    return pe;
-}
-
-float DirectSumPotentialEnergy2D(const std::vector<Vec2>& pos, int32_t n) {
-    float pe = 0.f;
-    for (int32_t i = 0; i < n; i++) {
-        for (int32_t j = i + 1; j < n; j++) {
-            const Vec2  d   = pos[i] - pos[j];
-            const float rr2 = dot(d, d) + Eps2;
-            pe += (G * Mass * Mass) * std::log(rr2);
-        }
-    }
-    return pe;
 }
 
 void ValidateAccuracy(const std::vector<Vec2>& pos, int32_t n, int32_t sampleCount) {

@@ -11,19 +11,15 @@
 #include "util/ThreadPool.h"
 
 // ----------- Spatial partitioning
-// Uniform grid (cell = 2*SmoothingRadius) as a CSR-sorted flat hash rather than
-// unordered_map<Cell, vector<int>> — no per-cell heap allocations, and cellStart[h]..cellStart[h+1]
-// is a contiguous slice instead of a pointer-chased bucket walk.
+// Uniform grid (cell = 2*SmoothingRadius) stored as a CSR-sorted flat hash: no per-cell
+// allocations, and cellStart[h]..cellStart[h+1] is a contiguous slice.
 //
-// The same sort reorders a "hot" copy of pos/vel/density/pressure/force by cell, kept separate
-// from Object/Renderable. The density/force loops then only touch ~40 bytes/particle and read
-// mostly-contiguous memory per cell, instead of scattering through `objects` in creation order.
+// The same sort reorders a "hot" copy of pos/vel/density/pressure/force by cell, separate from
+// Object/Renderable, so the density/force loops read mostly-contiguous memory.
 //
-// The table is unbounded, so cells can collide in the hash; cellX/cellY reject false positives so
-// a collision only wastes a candidate rather than double-counting one.
+// Cells can collide in the hash; cellX/cellY reject false positives.
 namespace {
-    // Derived from ActiveScene.particles; recomputed by RecomputeSphConstants() whenever a scene
-    // is loaded, not per-frame, so the hot loop still just reads a plain float.
+    // Derived from ActiveScene.particles by RecomputeSphConstants().
     float Radius   = 0.f;
     float RadiusSq = 0.f;
     float CellSize = 0.f;
@@ -40,8 +36,7 @@ namespace {
     uint32_t tableSize = 0;
 }
 
-// Clamped and NaN-safe: casting a NaN/out-of-range float to int32_t is UB, and a diverged particle
-// must never be able to index outside the grid (a non-finite one just lands in cell 0).
+// Clamped and NaN-safe (casting NaN/out-of-range floats to int32_t is UB); a non-finite particle lands in cell 0.
 static int32_t CellCoord(float p) {
     constexpr float Limit = 1.0e9f;
     const float c = std::floor(p / CellSize);
@@ -49,7 +44,7 @@ static int32_t CellCoord(float p) {
     return static_cast<int32_t>(std::clamp(c, -Limit, Limit));
 }
 
-// Teschner et al.'s spatial-hash primes; unsigned so the multiply can't hit signed overflow UB.
+// Teschner et al.'s spatial-hash primes; unsigned to avoid signed overflow.
 static uint32_t HashCell(int32_t x, int32_t y) {
     return (static_cast<uint32_t>(x) * 73856093u) ^ (static_cast<uint32_t>(y) * 19349663u);
 }
@@ -59,8 +54,7 @@ static uint32_t NextPow2(uint32_t v) {
     return v + 1;
 }
 
-// Rebuilt once per Update(). All arrays are namespace-scope and reused across calls, so a stable
-// particle count allocates nothing after warm-up.
+// Rebuilt once per Update(). Arrays are reused across calls, so a stable particle count allocates nothing.
 static void BuildGrid() {
     const int32_t n = static_cast<int32_t>(objects.size());
     tableSize = std::max<uint32_t>(16u, NextPow2(static_cast<uint32_t>(n) * 2u));
@@ -102,9 +96,8 @@ static void BuildGrid() {
     }
 }
 
-// Invokes fn(int32_t hotSlot) for every hot-array slot sharing pos's cell or one of its 8
-// neighbors. `pos` need not belong to a real particle (see ForEachGhost); a caller wanting to
-// exclude itself compares hot-slot indices.
+// Invokes fn(int32_t hotSlot) for every hot slot in pos's cell or its 8 neighbors. `pos` need not
+// belong to a real particle (see ForEachGhost); callers exclude themselves by hot-slot index.
 template <typename Fn>
 static void ForEachNeighbor(const Vec2& pos, Fn&& fn) {
     const int32_t cx = CellCoord(pos.x);
@@ -121,33 +114,30 @@ static void ForEachNeighbor(const Vec2& pos, Fn&& fn) {
     }
 }
 
-// Mirror-image ("method of images") boundary particles. SPH density near a wall is under-counted
-// (missing kernel mass from beyond the wall), which zero-clamps pressure there and lets particles
-// pile up against it. Reflecting nearby real particles across the wall and folding them into the
-// density/pressure sums like normal neighbors restores that missing mass directly.
+// Mirror-image ("method of images") boundary particles. SPH density near a wall is under-counted,
+// which zero-clamps pressure and lets particles pile up. Reflecting nearby real particles across
+// the wall and summing them like normal neighbors restores the missing mass.
 //
 // Position mirrors exactly; velocity mirrors with the wall-normal component negated (free-slip);
-// density/pressure carry over unchanged (the field is assumed locally symmetric across the wall).
-// Carries the hot-slot index rather than density/pressure directly — those are still being written
-// by other threads during the (parallel) density phase, so reading them here would race.
+// density/pressure carry over unchanged. The ghost carries the hot-slot index rather than
+// density/pressure, which other threads are still writing during the density phase.
 struct Ghost { Vec2 pos; Vec2 vel; int32_t src; };
 
 struct WallMirror { bool active = false; float wall = 0.f; };
 
 // Which wall (if either) `coord` is within Radius of, on one axis. `half` is the true container
-// edge (ScreenHalfWidth/Height), not the particle-radius-inset range particle centers clamp to.
+// edge, not the particle-radius-inset range centers clamp to.
 static WallMirror NearestWall(float coord, float half) {
     if (coord + half < Radius) return { true, -half };
     if (half - coord < Radius) return { true, half };
     return {};
 }
 
-// Invokes fn(const Ghost&) for every real particle whose mirror image — across whichever wall(s)
-// `pos` is within Radius of, including the diagonal double-mirror in a corner — falls within
-// Radius of `pos`. No-op away from all walls.
+// Invokes fn(const Ghost&) for every real particle whose mirror image (across whichever wall(s)
+// `pos` is within Radius of, including the corner double-mirror) falls within Radius of `pos`.
 template <typename Fn>
 static void ForEachGhost(const Vec2& pos, Fn&& fn) {
-    // No X wall to mirror across when the domain wraps — ForEachPeriodicX below handles that axis.
+    // No X wall to mirror across when the domain wraps; ForEachPeriodicX handles that axis.
     const WallMirror wx = ActiveScene.boundary.periodicX ? WallMirror{} : NearestWall(pos.x, ScreenHalfWidth());
     const WallMirror wy = NearestWall(pos.y, ScreenHalfHeight());
 
@@ -163,12 +153,10 @@ static void ForEachGhost(const Vec2& pos, Fn&& fn) {
             if (mirrorX) gp.x = 2.f * wx.wall - hotPos[j].x;
             if (mirrorY) gp.y = 2.f * wy.wall - hotPos[j].y;
 
-            // Free-slip: only the wall-normal velocity component reverses (impermeable, but no
-            // drag on the tangential flow). No-slip: the whole velocity reverses, so the SPH
-            // viscosity force between a real particle and its ghost averages their velocities
-            // toward zero right at the wall in every direction — that's what actually produces
-            // the wall drag a Poiseuille profile depends on; the friction hack in resolveAxis
-            // alone only fires on an actual wall collision, which barely happens once flow settles.
+            // Free-slip: only the wall-normal velocity reverses. No-slip: the whole velocity
+            // reverses, so the viscosity force drives velocity to zero at the wall; this produces the
+            // wall drag a Poiseuille profile needs, which the friction in resolveAxis alone can't
+            // once flow settles and stops colliding.
             Vec2 gv = hotVel[j];
             if (noSlip) {
                 gv = gv * -1.f;
@@ -185,11 +173,10 @@ static void ForEachGhost(const Vec2& pos, Fn&& fn) {
     if (wx.active && wy.active)  pass(true,  true);
 }
 
-// Same method of images as ForEachGhost, but across each scene obstacle's surface. A flat wall's
-// mirror is exact; here every obstacle within Radius of `pos` is mirrored across the tangent plane
-// at its nearest surface point (see ObstacleSurface), which is exact for a rect face and good for
-// a circle whose radius is well above the smoothing radius. Particles are never inside an
-// obstacle (Init skips them, Integrate pushes them out), so sd < 0 is simply ignored.
+// Same method of images as ForEachGhost, across each obstacle's surface: every obstacle within
+// Radius of `pos` is mirrored across the tangent plane at its nearest surface point (exact for a
+// rect face, good for circles much larger than the smoothing radius). Particles are never inside
+// an obstacle, so sd < 0 is ignored.
 template <typename Fn>
 static void ForEachObstacleGhost(const Vec2& pos, Fn&& fn) {
     const auto& obstacles = ActiveScene.obstacles;
@@ -208,9 +195,9 @@ static void ForEachObstacleGhost(const Vec2& pos, Fn&& fn) {
             const float dn = (p.x - q.x) * nx + (p.y - q.y) * ny;
             const Vec2  gp(p.x - 2.f * dn * nx, p.y - 2.f * dn * ny);
 
-            // A true boundary image lives inside the solid. Around a convex corner (or on a curved
-            // surface) the tangent plane's mirror throws neighbors beside the obstacle into the
-            // fluid instead: phantom particles that over-repel and fling fluid off the corner.
+            // A true boundary image lives inside the solid. Around a convex corner or curved
+            // surface the tangent-plane mirror would land in the fluid, creating phantom particles
+            // that over-repel.
             float gnx, gny;
             if (ObstacleSurface(o, gp.x, gp.y, gnx, gny) >= 0.f) return;
 
@@ -227,18 +214,15 @@ static void ForEachObstacleGhost(const Vec2& pos, Fn&& fn) {
 }
 
 // Periodic-image particles for a wrapped X boundary (see SceneBoundary::periodicX): a particle
-// near the right edge needs the real particles just past the left edge as neighbors (and vice
-// versa) for its density/pressure to come out as if the domain just continued — exactly what an
-// infinite channel would give. Unlike ForEachGhost's wall mirror, this is a translation (by the
-// domain width), not a reflection, and it carries real particles' velocities through unchanged.
+// near one edge sees the real particles past the opposite edge as neighbors. Unlike ForEachGhost,
+// this is a translation by the domain width, and velocities carry through unchanged.
 template <typename Fn>
 static void ForEachPeriodicX(const Vec2& pos, Fn&& fn) {
     if (!ActiveScene.boundary.periodicX) return;
     const float hw          = ScreenHalfWidth();
     const float domainWidth = 2.f * hw;
-    // A particle near one of the channel's four corners (both a Y wall and the periodic seam)
-    // needs the shifted-AND-mirrored diagonal image too — ForEachGhost never produces it since
-    // periodicX forces its own X-mirror off, leaving that corner case to be handled here instead.
+    // A particle near a corner (both a Y wall and the seam) also needs the shifted-and-mirrored
+    // diagonal image, which ForEachGhost never produces since periodicX turns its X-mirror off.
     const WallMirror wy = NearestWall(pos.y, ScreenHalfHeight());
     const bool noSlip   = ActiveScene.physics.noSlipWalls;
 
@@ -258,8 +242,7 @@ static void ForEachPeriodicX(const Vec2& pos, Fn&& fn) {
                 Vec2 gp = hotPos[j];
                 gp.x += shift;
                 gp.y = 2.f * wy.wall - hotPos[j].y;
-                // Same free-slip/no-slip rule as ForEachGhost's own Y-mirror case (see its
-                // comment) — the periodic X shift never touches velocity either way.
+                // Same free-slip/no-slip rule as ForEachGhost; the X shift never touches velocity.
                 Vec2 gv = hotVel[j];
                 if (noSlip) gv = gv * -1.f;
                 else        gv.y = -hotVel[j].y;
@@ -275,48 +258,34 @@ static void ForEachPeriodicX(const Vec2& pos, Fn&& fn) {
 // ----------- Kernels
 namespace {
     constexpr float Pi = 3.14159265358979323846f;
-    // Derived from Radius/RadiusSq (and Stiffness) by RecomputeSphConstants(); computed once per
-    // scene load rather than per neighbor pair.
+    // Derived from Radius/RadiusSq (and Stiffness) by RecomputeSphConstants().
     float DensityNorm      = 0.f;
     float PressureGradNorm = 0.f;
     float SoundSpeed       = 0.f;
     float PolytropicGamma  = 0.f; // 1 + 1/polytropicIndex; only used when eos == Polytropic
 }
 
-// Recomputes every SPH constant derived from ActiveScene.particles. Called by LoadScene()
-// whenever a new scene is applied — never per-frame, so the hot loop below just reads plain
-// floats instead of paying for std::pow/std::sqrt or a scene-struct indirection per particle pair.
+// Recomputes every SPH constant derived from ActiveScene.particles. Called by LoadScene(), so the
+// hot loops read plain floats.
 void RecomputeSphConstants() {
-    // Floored: a zero/negative radius (an easy typo in the UI) would divide by zero in the cell
-    // size and every kernel norm below.
+    // Floored: a zero/negative radius would divide by zero in the cell size and kernel norms.
     Radius   = std::max(ActiveScene.particles.smoothingRadius, 0.1f);
     RadiusSq = Radius * Radius;
     CellSize = 2.f * Radius;
 
-    // radius^5 / radius^8, expanded by hand since std::pow isn't constexpr — turns a std::pow
-    // call on every particle pair into a plain multiply against a value computed once.
+    // radius^5 / radius^8, expanded by hand to avoid std::pow.
     const float radius4 = RadiusSq * RadiusSq;
     const float radius5 = radius4 * Radius;
     const float radius8 = radius4 * radius4;
-    // True 2D Poly6/Spiky normalizations (this sim is 2D — see Genuine2D gravity), not the 3D ones
-    // (315/64/h^9, -45/h^6) an earlier version of this code used: integrating each kernel over a
-    // disk of radius h (rather than a 3D ball) gives 4/(pi*h^8) for Poly6 and -30/(pi*h^5) for
-    // Spiky's gradient. This changes the actual density values CalculateDensity reports for a given
-    // packing, which invalidates every targetDensity/stiffness calibration tuned against the old 3D
-    // norm (see Scene.cpp's MakeSelfGravity — its Lane-Emden stiffness derivation and its
-    // resolution's targetDensity/scale^3 scaling both assumed the old normalization and need
-    // re-deriving against this one).
+    // 2D Poly6/Spiky normalizations: integrating each kernel over a disk of radius h gives
+    // 4/(pi*h^8) for Poly6 and -30/(pi*h^5) for Spiky's gradient.
     DensityNorm      = 4.f / (Pi * radius8);
     PressureGradNorm = -30.f / (Pi * radius5);
     PolytropicGamma  = 1.f + 1.f / ActiveScene.particles.polytropicIndex;
 
-    // Characteristic speed for the artificial-viscosity term (CalculatePressureForce), not an
-    // exact per-particle quantity — just a reference sqrt(dP/drho). WCSPH's stiffness IS
-    // approximately that (c^2 ~ stiffness by construction), but the Polytropic EOS's stiffness is
-    // K in pressure=K*density^gamma, a completely different scale (~1e23 for this sim's Self-Gravity
-    // calibration, vs WCSPH's ~1e4) — sqrt(K) directly would give a nonsense "sound speed" and blow
-    // the viscosity term up on the first substep. Evaluate the real dP/drho = K*gamma*rho^(gamma-1)
-    // at targetDensity instead.
+    // Reference sound speed sqrt(dP/drho) for the artificial-viscosity term. WCSPH's stiffness is
+    // approximately c^2, but the Polytropic stiffness K (pressure = K*density^gamma) is on a
+    // completely different scale, so evaluate dP/drho = K*gamma*rho^(gamma-1) at targetDensity.
     if (ActiveScene.particles.eos == EosModel::Polytropic) {
         const auto& p = ActiveScene.particles;
         SoundSpeed = std::sqrt(p.stiffness * PolytropicGamma * std::pow(p.targetDensity, PolytropicGamma - 1.f));
@@ -325,8 +294,7 @@ void RecomputeSphConstants() {
     }
 }
 
-// Poly6-style kernel. Takes squared distance directly — callers already have it, and the kernel
-// only ever needs dst^2, so there's no reason to sqrt just to square it back.
+// Poly6-style kernel. Takes squared distance, which callers already have.
 static float DensityKernel (float distSq)
 {
     float val = RadiusSq - distSq;
@@ -341,7 +309,7 @@ static float PressureKernelGradient (float dst)
     return PressureGradNorm * val * val;
 }
 
-// Repeated-squaring integer power — avoids std::pow's exp/log path for a fixed small exponent.
+// Integer power by repeated squaring (avoids std::pow).
 static float IntPow (float base, int exp)
 {
     float result = 1.f;
@@ -360,9 +328,7 @@ static void CalculatePressure (int32_t k)
 {
     const auto& p = ActiveScene.particles;
     if (p.eos == EosModel::Polytropic) {
-        // Pure polytrope: no targetDensity offset, so unlike WCSPH below there's nothing to clamp
-        // — density is always > 0 (CalculateDensity always includes the dist==0 self-term), and a
-        // positive base raised to any real exponent stays positive.
+        // Pure polytrope: density is always > 0 (it includes the self-term), so there's nothing to clamp.
         hotPressure[k] = p.stiffness * std::pow(hotDensity[k], PolytropicGamma);
         return;
     }
@@ -406,12 +372,11 @@ static void CalculatePressureForce (int32_t k)
     const bool  morris    = p.viscosityModel == ViscosityModel::Morris;
     Vec2 forceVec(0.f, 0.f);
 
-    // Shared pairwise force, used for both real neighbors and ghost mirror images below.
+    // Pairwise force shared by real neighbors and ghost images.
     auto accumulate = [&](const Vec2& bPos, const Vec2& bVel, float bDensityRaw, float bPressure) {
         Vec2 difference = pos - bPos;
         float distSq = dot(difference, difference);
-        // Reject on squared distance before paying for a sqrt — the 3x3 cell block covers a much
-        // larger area than the smoothing radius circle, so most candidates fail this check.
+        // Reject on squared distance before the sqrt; most candidates in the 3x3 block fail.
         if (distSq >= RadiusSq || distSq == 0.f) return;
 
         float dist = std::sqrt(distSq);
@@ -432,13 +397,11 @@ static void CalculatePressureForce (int32_t k)
 
         forceVec -= dir * (grad * coefficient);
 
-        // Morris, Fox & Zhu (1997) viscosity, in this code's unit-mass / number-density form:
+        // Morris, Fox & Zhu (1997) viscosity, in unit-mass / number-density form:
         //   a_i += nu * (1/rho_i + 1/rho_j) * (r * dW/dr) / (r^2 + 0.01 h^2) * (v_i - v_j)
-        // i.e. Brookshaw's SPH Laplacian, which for smooth v tends to nu * laplacian(v) (in 2D
-        // and 3D alike). dW/dr < 0, so this always drags v_i toward v_j — along the FULL relative
-        // velocity, unlike Monaghan's term above, which only sees its component along `dir`.
-        // Uses the Spiky gradient, whose kernel is normalised in 2D like the pressure term's.
-        // Wall ghosts carry -v under no-slip (see ForEachGhost), pinning u = 0 at the wall.
+        // Brookshaw's SPH Laplacian, tending to nu * laplacian(v). dW/dr < 0, so it always drags v_i
+        // toward v_j along the full relative velocity (Monaghan's term only sees the part along
+        // `dir`). Wall ghosts carry -v under no-slip, pinning u = 0 at the wall.
         if (morris) {
             const float lap = p.kinematicViscosity * (1.f / pDensity + 1.f / bDensity)
                             * dist * grad / (distSq + 0.01f * RadiusSq);
@@ -510,9 +473,8 @@ void Init() {
         }
     };
 
-    // See ForEachGroupPoint (Scene.h): a circle is a Fibonacci-spiral disk with exactly the count its
-    // area implies (one particle per spacing^2, preserving the initial SPH density the scene's
-    // constants were calibrated against); a rect is a square lattice.
+    // See ForEachGroupPoint (Scene.h): a circle is a Fibonacci spiral with one particle per
+    // spacing^2 (preserving the calibrated initial density); a rect is a square lattice.
     for (const SceneGroup& g : groups) {
         baseColor = g.customColor ? g.color : particles.circleColor;
         ForEachGroupPoint(g, GroupSpacing(g, radius), spawnAt);
@@ -520,15 +482,14 @@ void Init() {
 }
 
 void Update(float) {
-    // A zero/negative/non-finite smoothing radius makes every cell coordinate and kernel norm
-    // degenerate; skip the force pass instead of feeding NaN into the grid.
+    // A zero/negative/non-finite smoothing radius degenerates the grid and kernels: skip the pass.
     if (!(CellSize > 0.f) || !std::isfinite(CellSize) || objects.empty()) return;
     BuildGrid();
 
     const int32_t n = static_cast<int32_t>(hotPos.size());
 
-    // Each k writes only its own hot slot, so these are datarace-free; ParallelFor blocks until a
-    // call's chunks all finish, so density/pressure are fully settled before the force pass reads them.
+    // Each k writes only its own hot slot, so these are datarace-free; ParallelFor blocks, so
+    // density/pressure are settled before the force pass.
     ParallelFor(n, [](int32_t begin, int32_t end) {
         for (int32_t k = begin; k < end; k++) { CalculateDensity(k); CalculatePressure(k); }
     });
@@ -536,8 +497,7 @@ void Update(float) {
         for (int32_t k = begin; k < end; k++) CalculatePressureForce(k);
     });
 
-    // Self-gravity, on top of the SPH pressure force above — off for most scenes (see
-    // SceneGravity), so only pay for a tree build/traversal when a scene actually wants it.
+    // Self-gravity on top of the SPH pressure force; the tree is only built when a scene enables it.
     const auto& grav = ActiveScene.gravity;
     if (grav.enabled) {
         if (grav.method == GravityMethod::Genuine2D) {

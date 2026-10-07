@@ -54,18 +54,15 @@ ViscosityModel ViscosityModelFromString(const std::string& s, ViscosityModel fal
     if (s == "Morris")   return ViscosityModel::Morris;
     return fallback;
 }
-// Preset files are one field per line ("key=value"); a literal newline in a user-typed
-// name/description would corrupt that, so it's flattened to a space on save. Not otherwise
-// escaped (e.g. an '=' in a description) — these are short, hand-typed labels, not adversarial
-// input, so a plain flat format is enough.
+// Preset files are one "key=value" per line, so newlines in a name/description are flattened to a
+// space on save. Nothing else is escaped.
 std::string SanitizeForLine(const std::string& s) {
     std::string out = s;
     std::replace(out.begin(), out.end(), '\n', ' ');
     return out;
 }
 
-// One Scene field per entry, driving both directions from the same table so save/load can't
-// drift out of sync by editing only one of two separately-written switch statements.
+// One Scene field per entry; the same table drives both save and load.
 struct PresetField {
     const char*                                     key;
     std::function<std::string(const Scene&)>        get;
@@ -200,8 +197,7 @@ const std::vector<PresetField>& Fields() {
     return fields;
 }
 
-// Events are a list, so they don't fit the one-key-per-Scene-field table above: written as
-// "event.count=N" plus "event.<i>.<field>=value" lines instead.
+// Events are a list, written as "event.count=N" plus "event.<i>.<field>=value" lines.
 struct EventField {
     const char*                                          key;
     std::function<std::string(const SceneEvent&)>        get;
@@ -262,7 +258,7 @@ bool LoadEventKey(Scene& out, const std::string& key, const std::string& value) 
     return false;
 }
 
-// Persistent-color regions: "pin.count=N" plus "pin.<i>.<field>=value", like events.
+// Persistent-color regions: "pin.count=N" plus "pin.<i>.<field>=value".
 struct PinField {
     const char*                                                key;
     std::function<std::string(const SceneColorRegion&)>        get;
@@ -313,7 +309,7 @@ bool LoadPinKey(Scene& out, const std::string& key, const std::string& value) {
     return false;
 }
 
-// Obstacles: "obstacle.count=N" plus "obstacle.<i>.<field>=value", like color regions.
+// Obstacles: "obstacle.count=N" plus "obstacle.<i>.<field>=value".
 struct ObstacleField {
     const char*                                              key;
     std::function<std::string(const SceneObstacle&)>         get;
@@ -364,8 +360,8 @@ bool LoadObstacleKey(Scene& out, const std::string& key, const std::string& valu
     return false;
 }
 
-// Particle groups: "group.count=N" plus "group.<i>.<field>=value". Only meaningful with
-// groups.enabled=1 (otherwise the legacy spawn.* block is used).
+// Particle groups: "group.count=N" plus "group.<i>.<field>=value". Only used with groups.enabled=1;
+// otherwise the spawn.* block applies.
 struct GroupField {
     const char*                                         key;
     std::function<std::string(const SceneGroup&)>       get;
@@ -490,10 +486,3 @@ std::vector<ScenePresetEntry> ScanUserPresets(const std::filesystem::path& prese
     return entries;
 }
 
-Scene BuildSceneFromPreset(const ScenePresetEntry& entry, int gridCountX, int gridCountY) {
-    Scene s;
-    LoadScenePreset(entry.path, s);
-    s.spawn.gridCountX = std::max(gridCountX, 1);
-    s.spawn.gridCountY = std::max(gridCountY, 1);
-    return s;
-}

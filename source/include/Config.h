@@ -2,8 +2,7 @@
 
 struct Color { float r, g, b, a; };
 
-// Window setup only — everything tunable per-run (boundaries, spawn layout, physics/particle
-// constants) now lives in Scene.h/Scene.cpp as runtime scene presets.
+// Window setup only; everything else tunable lives in Scene.h.
 namespace Config {
     constexpr const char* WindowTitle  = "Stjarna";
     constexpr int         WindowWidth  = 2560;

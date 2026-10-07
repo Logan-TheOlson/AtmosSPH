@@ -1,10 +1,8 @@
 #pragma once
 #include <imgui.h>
 
-// Shared palette for the whole UI: ApplyModernStyle (VulkanContext.cpp) builds ImGui's style from
-// these, and the panels/gizmos draw their own accents (chips, event areas) with the same values so
-// everything reads as one system. Dark slate with a soft periwinkle accent — dark but not black, so
-// panels read as raised surfaces over the (darker) sim canvas.
+// Shared UI palette: ApplyModernStyle (VulkanContext.cpp) builds ImGui's style from these, and
+// panels/gizmos use the same values for their accents.
 namespace Theme {
     inline const ImVec4 Canvas   (0.114f, 0.133f, 0.173f, 1.f); // #1d222c — sim view clear color
     inline const ImVec4 Panel    (0.149f, 0.165f, 0.208f, 1.f); // #262a35 — window background

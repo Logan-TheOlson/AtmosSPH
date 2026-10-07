@@ -1,7 +1,3 @@
-//
-// Created by Logan on 7/21/2026.
-//
-
 #include "util/Vector.h"
 
 float distance(const Vec2& a, const Vec2& b)

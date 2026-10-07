@@ -13,18 +13,13 @@ bool Recorder::Start(const std::string& outputPath, int width, int height, int f
     Stop();
 
 #ifndef _WIN32
-    // Writing to the ffmpeg pipe after it exits (crashed, killed, or never execed because ffmpeg
-    // isn't on PATH) raises SIGPIPE, whose default disposition kills this whole process. Ignoring
-    // it makes the fwrite in WriterLoop fail with EPIPE instead, which the existing "drop rather
-    // than stall" queuing already tolerates.
+    // Writing to the pipe after ffmpeg exits raises SIGPIPE, which would kill this process by
+    // default. Ignoring it makes the fwrite in WriterLoop fail with EPIPE instead.
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    // The sim's own thread pool (ParallelFor) already saturates every hardware thread every
-    // substep. x264 defaults to using just as many threads for real-time encoding, so left
-    // unbounded it would compete 1:1 with the simulation for CPU time and slow it down just as
-    // badly as a blocking pipe would have. Capping it to a quarter of the machine (and using the
-    // cheapest preset) keeps encoding cheap enough to not be felt by the sim.
+    // The sim's thread pool already saturates every hardware thread, so cap x264 to a quarter of
+    // the machine (with the cheapest preset) to keep encoding from slowing the sim.
     const unsigned encoderThreads = std::max(1u, std::thread::hardware_concurrency() / 4);
 
     std::ostringstream cmd;
@@ -55,7 +50,7 @@ void Recorder::SubmitFrame(const void* data, size_t bytes, std::function<void()>
     if (!pipe_) { release(); return; }
 
     std::lock_guard<std::mutex> lock(queueMutex_);
-    if (queue_.size() >= kMaxQueuedFrames) { release(); return; } // encoder can't keep up — drop rather than stall the caller
+    if (queue_.size() >= kMaxQueuedFrames) { release(); return; } // encoder can't keep up: drop the frame
 
     queue_.push_back({ data, bytes, std::move(release) });
     queueCv_.notify_one();
@@ -71,8 +66,7 @@ void Recorder::WriterLoop() {
             job = std::move(queue_.front());
             queue_.pop_front();
         }
-        // The (potentially slow, cross-PCIe) read of `job.data` happens right here, off the
-        // caller's thread — that's the whole point of this queue.
+        // The slow read of `job.data` happens here, off the caller's thread.
         fwrite(job.data, 1, job.bytes, pipe_);
         job.release();
     }
@@ -91,11 +85,8 @@ void Recorder::Stop() {
     }
     queueCv_.notify_all();
 
-    // Bound how long we wait for the worker to drain cleanly. A stalled ffmpeg (full disk,
-    // suspended process, stuck writing to a network filesystem) can leave it blocked inside
-    // fwrite() forever; every caller of Stop() (the Cancel button, the length-cap auto-stop, and
-    // ~Recorder() at process exit) runs on the main thread, so an unbounded join() here would
-    // freeze the whole app instead of just abandoning this one recording.
+    // Bound the wait for the worker to drain: a stalled ffmpeg can block it in fwrite() forever,
+    // and an unbounded join() here would freeze the main thread.
     constexpr auto kDrainTimeout = std::chrono::seconds(5);
     bool drained;
     {
@@ -105,13 +96,13 @@ void Recorder::Stop() {
 
     if (!drained) {
         fprintf(stderr, "Recorder: ffmpeg pipe stalled, abandoning writer thread\n");
-        worker_.detach(); // still owns pipe_; leaked rather than closed out from under it
+        worker_.detach(); // still owns pipe_, so leak it rather than close it underneath
         pipe_ = nullptr;
         queue_.clear();
         return;
     }
 
-    if (worker_.joinable()) worker_.join(); // known to have already returned, so this is immediate
+    if (worker_.joinable()) worker_.join(); // already returned, so immediate
 
 #ifdef _WIN32
     _pclose(pipe_);

@@ -3,13 +3,11 @@
 #include <imgui.h>
 #include <vector>
 
-// Mouse editing of SceneEvents directly in the sim view: drag on empty space to create an area,
-// drag an area to move it, drag its handles to resize it or to set the push direction/strength.
-// Everything is drawn on ImGui's background draw list, so it shows live but can never end up in a
-// recorded video (recording captures the scene pass, before ImGui).
+// Mouse editing of SceneEvents in the sim view: drag empty space to create an area, drag an area
+// to move it, drag its handles to resize it or set the push direction/strength. Drawn on ImGui's
+// background draw list, so it never appears in recordings.
 namespace EventGizmo {
-    // Screen <-> world mapping for the sim view. World units are simulation pixels with +y up;
-    // screen units are ImGui points (y down).
+    // Screen <-> world mapping. World units are simulation pixels, +y up; screen units are ImGui points, y down.
     struct View {
         ImVec2 origin;               // screen position of world (0, 0)
         float  scale = 1.f;          // ImGui points per world px (1 / framebuffer scale)
@@ -41,8 +39,7 @@ namespace EventGizmo {
         bool changed = false;   // any existing event's geometry/acceleration was edited
     };
 
-    // Draws every event and handles the mouse/keyboard. Call once per frame after the panels have
-    // been submitted (so io.WantCaptureMouse already reflects them).
+    // Draws every event and handles input. Call once per frame after the panels are submitted.
     Result Update(const Context& ctx);
 
     // World px of arrow length per unit of acceleration/kick (fixed so arrow length reads as strength).

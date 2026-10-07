@@ -44,8 +44,7 @@ void Update(float dt);
 
 std::vector<Object> objects;
 
-// Directory the running executable lives in, so output files land next to it regardless of the
-// process's current working directory.
+// Directory of the running executable, so output files land next to it regardless of the working directory.
 static std::filesystem::path ExecutableDir() {
 #ifdef _WIN32
     char path[MAX_PATH];
@@ -56,27 +55,8 @@ static std::filesystem::path ExecutableDir() {
     return std::filesystem::current_path();
 }
 
-// One kinetic-energy sample: `run` distinguishes separate Start-Simulation/Restart sessions
-// within the same process, so a discontinuity from a reset doesn't read as an instability event
-// when the CSV is plotted.
-struct KESample { int run; int frame; float ke; };
-
-// Appends run,frame,kineticEnergy rows collected over the process's lifetime to a CSV next to the
-// executable, for offline comparison (e.g. plotting energy stability across runs in Python).
-static void WriteKineticEnergyCsv(const std::vector<KESample>& keByFrame) {
-    const auto outPath = ExecutableDir() / "kinetic_energy.csv";
-    std::ofstream out(outPath);
-    if (!out) return;
-
-    out << "run,frame,kinetic_energy\n";
-    for (const auto& s : keByFrame)
-        out << s.run << ',' << s.frame << ',' << s.ke << '\n';
-}
-
-// Bins particles by y-position across the current scene's channel height and writes each bin's
-// average x-velocity to a CSV next to the executable — e.g. the parabolic profile a Poiseuille
-// scene should develop. Overwritten every time this is called (see the main loop's call site),
-// so the file always reflects a recent snapshot rather than one moment early in the transient.
+// Bins particles by y-position across the channel height and writes each bin's average x-velocity
+// to a CSV next to the executable. Overwritten on every call, so it always holds a recent snapshot.
 static void WriteVelocityProfileCsv() {
     constexpr int kBins = 40;
     const float hh = ScreenHalfHeight();
@@ -107,50 +87,40 @@ static void WriteVelocityProfileCsv() {
 static App      app;
 static Profiler profiler; // frame/render timing, shown in the live panel's Run card
 
-// Simulation only advances in Running/Rendering; Menu leaves `objects` untouched (cleared) and
-// skips physics entirely so the menu screen never pays SPH cost. Rendering runs the same physics
-// as Running, but crunched back-to-back at a fixed 1/fps dt and always drawn+captured straight to
-// video — no real-time pacing, and no live playback afterward (see AdvanceRendering/
-// DrawRenderingOverlay).
+// The simulation only advances in Running/Rendering; Menu skips physics entirely. Rendering runs
+// the same physics back-to-back at a fixed 1/fps dt, drawn and captured straight to video with
+// no real-time pacing (see AdvanceRendering/DrawRenderingOverlay).
 enum class AppState { Menu, Running, Rendering };
 static AppState appState = AppState::Menu;
 
-// Freezes physics (rendering, recording, and CSV data-saving all keep running) — toggled by
-// Space or the Pause/Resume button. Independent of appState so a paused sim stays paused across
-// UI redraws; only Restart/Menu/StartSimulation touch it.
+// Freezes physics (rendering, recording and data-saving keep running). Toggled by Space or the
+// Pause/Resume button; only Restart/Menu/StartSimulation reset it.
 static bool paused = false;
 
-// Periodic-channel scenes (Poiseuille) drift the whole particle cloud sideways as the imposed
-// force advects it, which makes the pressure-driven profile (fast center, slow walls) hard to
-// read — it's buried under the bulk translation. When enabled, the drawn (not simulated) x
-// position is offset by the accumulated mean flow velocity each substep (see Integrate), so the
-// cloud appears stationary on average and only the relative motion between fast/slow bands shows.
+// Periodic-channel scenes drift sideways as the force advects the cloud, burying the profile
+// under bulk translation. When enabled, the drawn (not simulated) x position is offset by the
+// accumulated mean flow velocity each substep (see Integrate), so only relative motion shows.
 static bool  cameraFollow  = true;
 static float cameraOffsetX = 0.f;
 
-constexpr float StepDt         = 1.f / 60.f; // fixed nominal frame length for manual stepping, so a
-                                              // step is deterministic regardless of real elapsed time
+constexpr float StepDt         = 1.f / 60.f; // fixed frame length for manual stepping
 constexpr int   BigStepFrames  = 10;         // frames advanced by Left Arrow / the "Step x10" button
 
-// Recording + data-save configuration for one run — a manual "Start Simulation" click or one
-// queued entry (see QueueEntry) — kept separate from the Scene itself so a queue entry can
-// snapshot both independently.
+// Recording + data-save configuration for one run (a manual start or one queued entry), kept
+// separate from the Scene so a queue entry can snapshot both.
 struct RunSettings {
     bool  record = false;
-    // Optional short label appended to the auto-generated filename (see RunNaming) — empty by
-    // default, unlike the old flat "capture"/"data" titles this replaces, since the generated
-    // name alone is already distinguishing.
+    // Optional short label appended to the generated filename (see RunNaming).
     char  title[128] = "";
     int   fps = 60;
     float lengthSeconds = 10.f;
-    // Only meaningful alongside `record`: renders+captures every frame back-to-back at 1/fps
-    // instead of pacing to real time, so the video finishes in however long that takes to compute
-    // rather than lengthSeconds of real time — see AdvanceRendering.
+    // Only with `record`: renders and captures every frame back-to-back at 1/fps instead of
+    // pacing to real time (see AdvanceRendering).
     bool  batchRender = false;
 
     bool  saveData = false;
     char  dataTitle[128] = "";
-    int   dataRate = 30; // samples/sec, independent of render fps — see the "Save data to CSV" section
+    int   dataRate = 30; // samples/sec, independent of render fps
     float dataLengthSeconds = 10.f;
     bool  dataPosition = true;
     bool  dataVelocity = true;
@@ -158,8 +128,7 @@ struct RunSettings {
     bool  dataDensity = true;
     bool  dataPressure = true;
 
-    // Channel velocity profile (see ProfileLogger): per-bin averages across the channel height
-    // instead of per-particle rows, so a long Poiseuille run stays well under a few MB.
+    // Channel velocity profile (see ProfileLogger): per-bin averages instead of per-particle rows.
     bool  saveProfile = false;
     char  profileTitle[128] = "";
     int   profileRate = 5;               // samples per SIM second
@@ -168,22 +137,17 @@ struct RunSettings {
 };
 
 struct MenuConfig {
-    // Index into the combined list of the 3 compiled ScenePresets followed by userPresets (see
-    // CombinedX helpers below) — not just ScenePresets, so a saved custom preset shows up in the
-    // same combo.
+    // Index into the built-in ScenePresets followed by userPresets (see the Combined helpers below).
     int          sceneIndex = 0;
-    // Full editable working copy — reseeded from BuildScene()/BuildSceneFromPreset() only when
-    // sceneIndex or the grid count actually changes (see DrawMenu); every other field is free to
-    // hand-edit and is left exactly as the user set it on every other frame. Assigned for real in
-    // main(), not via a default member initializer — see the comment there for why.
+    // Editable working copy, reseeded from BuildScene()/LoadScenePreset() only when sceneIndex or
+    // the grid count changes. Assigned in main(), not via a default member initializer.
     Scene        scene;
     RunSettings  run;
 };
 static MenuConfig menuConfig;
 
-// Presets saved via the menu's "Presets" section, scanned from disk at startup and after each
-// save. Combined with the 3 compiled ScenePresets (Scene.h) into one list for the scene combo —
-// built-ins keep fixed indices [0, ScenePresets.size()), user presets follow.
+// Presets saved via the menu, scanned at startup and after each save. The scene combo lists the
+// built-ins at [0, ScenePresets.size()), then these.
 static std::vector<ScenePresetEntry> userPresets;
 
 static void RefreshUserPresets() {
@@ -205,31 +169,27 @@ static const std::string& CombinedDescription(int i) {
                                  : userPresets[i - static_cast<int>(ScenePresets.size())].description;
 }
 
-// Owned directly by Engine.cpp (unlike Recorder, which lives behind App/VulkanContext because it
-// needs the composited GPU frame) since the data it samples — `objects` — already lives here.
+// Owned here (unlike Recorder) because the data it samples, `objects`, lives here.
 static DataRecorder dataRecorder;
-static float        dataAccum{ 0.f };        // seconds since the last sample, gated at the active run's dataRate, like Recorder's fps gate
-static float        dataElapsed{ 0.f };       // sim seconds since this data save started, for the CSV's time column
+static float        dataAccum{ 0.f };        // seconds since the last sample, gated at the active run's dataRate
+static float        dataElapsed{ 0.f };       // sim seconds since this data save started (CSV time column)
 static uint32_t     dataSavedFrames{ 0 };
 static int          dataRateActive{ 0 };
-static float        dataLengthActive{ 0.f };  // 0 = unlimited, mirrors the active run's video length cap
+static float        dataLengthActive{ 0.f };  // 0 = unlimited
 
 // Defined further down; declared here for ProfileLogger.
 float ScreenHalfWidth();
 float ScreenHalfHeight();
 
-// Simulated seconds since the last ResetSimulation() — advanced only by AdvanceSimulation, so it
-// stops while paused and is exact in both live and batch modes (unlike the real-time dt the
-// per-particle data save accumulates).
+// Simulated seconds since the last ResetSimulation(); advanced only by AdvanceSimulation, so it stops while paused.
 static double simTime = 0.0;
 
-// Channel velocity-profile logger for Poiseuille-type runs. Every 1/rate simulated seconds it bins
-// particles by y across the channel ([-H/2, H/2], wall to wall) and writes two small CSVs:
+// Channel velocity-profile logger. Every 1/rate simulated seconds it bins particles by y across the
+// channel and writes two small CSVs:
 //   <name>_profile.csv : frame,time,bin,y_center,count,mean_vx,std_vx,mean_vy,mean_density
 //   <name>_frames.csv  : frame,time,mean_vx,max_vx,rms_vy,mean_density,std_density,min_density,max_density
-// Both start with '#'-prefixed lines recording the run's geometry and parameters (H and L as
-// actually used, so the analysis never has to assume them) — read with pandas' comment='#'.
-// Written synchronously on the sim thread: one sample is only nBins+1 rows.
+// Both start with '#'-prefixed lines recording the run's geometry and parameters (read with
+// pandas' comment='#'). Written synchronously on the sim thread; a sample is only nBins+1 rows.
 struct ProfileLogger {
     std::ofstream profile;
     std::ofstream frames;
@@ -342,20 +302,9 @@ struct ProfileLogger {
 };
 static ProfileLogger profileLogger;
 
-// Identifies which Start-Simulation/Restart session a KESample belongs to (see WriteKineticEnergyCsv).
-static int runIndex = -1;
 
-// Accumulated across the process's lifetime and written once at shutdown (see main()) — file
-// scope (not a main()-local) so DrawAndSubmitFrame can push to it from both Running's per-real-
-// frame call site and AdvanceRendering's per-video-frame one.
-static std::vector<KESample> keByFrame;
-static int lastRunIndexForKE = -1;
-static int runFrameForKE     = 0;
-
-// Live coloring: recolors every particle by a current simulation field instead of its scene
-// color, so a fast flow (e.g. Poiseuille) is readable even when it's moving too fast to track
-// individual particles. Each field gets its own low/high color pair, independently editable, so
-// switching modes is visually obvious rather than "the same gradient, different numbers".
+// Live coloring: recolors every particle by a simulation field instead of its scene color. Each
+// field has its own editable low/high color pair.
 enum class ColorMode { Off, Speed, Pressure, Density };
 static const char* ColorModeNames[] = { "Off (scene color)", "Speed", "Pressure", "Density" };
 
@@ -382,10 +331,8 @@ static Color LerpColor(const Color& a, const Color& b, float t) {
     return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1.f };
 }
 
-// The mode + gradient picker that decides how DrawAndSubmitFrame colors particles — shared by
-// DrawRunningOverlay (the live corner panel) and DrawMenu's Record section, so a batch render
-// (which never visits Running) still gets a chance to set this before the video starts, not just
-// whatever colorMode happened to be left over from a previous live session.
+// The mode + gradient picker used by DrawAndSubmitFrame, shared by the live panel and the setup
+// view so a batch render can set it before starting.
 static void DrawColorByControls(float contentWidth) {
     const float swatchSize = ImGui::GetFrameHeight();
 
@@ -399,8 +346,7 @@ static void DrawColorByControls(float contentWidth) {
         ColorRamp& ramp = colorRamps[modeIdx];
         ImGui::Spacing();
 
-        // Label on the left, swatch pinned to the content's right edge — NoInputs leaves just the
-        // swatch button here, all sliders live in the popup it opens.
+        // Label on the left, swatch on the right; NoInputs leaves just the button, with sliders in its popup.
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Low");
         ImGui::SameLine(contentWidth - swatchSize);
@@ -413,16 +359,10 @@ static void DrawColorByControls(float contentWidth) {
     }
 }
 
-// Per-Scene-sub-struct editable sections for the menu's CollapsingHeaders (see DrawMenu) — split
-// out the same way DrawColorByControls is, one function per struct rather than one giant flat
-// block, so each preset's full parameter set is reachable without recompiling.
+// Editable sections for the menu's CollapsingHeaders, one function per Scene sub-struct.
 
-// One labelled input row: the label in a fixed left-hand column (wrapping onto a second line if
-// it's long), the widget filling the right-hand column. Every labelled menu field goes through
-// this. The old layout drew the label to the RIGHT of the widget and shrank the widget by the
-// label's width , so a long label squeezed the input box and its +/-
-// buttons until the value was cut off. Here the widget width never depends on the label.
-// Call immediately before the widget, and give the widget a "##"-hidden label.
+// One labelled input row: the label in a fixed left column (wrapping if long), the widget filling
+// the right. Call immediately before the widget and give it a "##"-hidden label.
 static void FormRow(float contentWidth, const char* label) {
     const float labelW  = std::floor(contentWidth * 0.52f);
     const float startX  = ImGui::GetCursorPosX();
@@ -437,25 +377,23 @@ static void FormRow(float contentWidth, const char* label) {
 }
 
 
-// Persistent-color patches (see SceneColorRegion): particles spawned inside keep the color all run.
-// Edited in the setup view like events: right-panel tab + drag gizmo (see DrawColorRegionsPanel).
+// Persistent-color patches (see SceneColorRegion), edited like events: panel + drag gizmo.
 static SceneColorRegion placeRegionTemplate;
 static int              selectedRegion = -1;
 // True on frames where the "Persistent Color" window is the visible tab of the right dock node.
 static bool             colorsTabActive = false;
 
-// Solid obstacles (see SceneObstacle): same editing model as the color areas, in their own tab.
+// Solid obstacles (see SceneObstacle): same editing model as the color areas.
 static SceneObstacle    placeObstacleTemplate;
 static int              selectedObstacle = -1;
 static bool             obstaclesTabActive = false;
 
-// Particle groups (see SceneGroup): the spawn block(s), edited like obstacles in their own tab.
+// Particle groups (see SceneGroup): the spawn blocks, edited like obstacles.
 static SceneGroup       placeGroupTemplate;
 static int              selectedGroup = -1;
 static bool             groupsTabActive = false;
 
-// Shared by SceneColorRegion, SceneObstacle and SceneGroup (identical shape fields; the first two
-// also share the color swatch, groups draw their own optional-color row).
+// Shared by SceneColorRegion, SceneObstacle and SceneGroup (groups draw their own optional-color row).
 template <typename Shape>
 static void DrawColorRegionFields(Shape& r, float contentWidth, bool withColor = true) {
     static const char* ShapeNames[] = { "Circle", "Rect" };
@@ -499,8 +437,7 @@ static void DrawBoundarySection(SceneBoundary& b, float contentWidth) {
     ImGui::Checkbox("Periodic X", &b.periodicX);
 }
 
-// ---- Physics tab sections, one per concern: what the fluid is, how it flows, what pushes on it,
-// how it meets walls, and how finely time is stepped. Each setting appears in exactly one of them.
+// ---- Physics tab sections, one per concern: fluid, flow, forcing, walls and time stepping.
 
 static void DrawExternalForceSection(ScenePhysics& p, float contentWidth) {
     FormRow(contentWidth, "Force (x, y)");
@@ -558,8 +495,7 @@ static void DrawGravitySection(SceneGravity& g, float contentWidth) {
 static const char* EosModelNames[] = { "WCSPH", "Polytropic" };
 static const char* ViscosityModelNames[] = { "Monaghan (artificial)", "Morris (physical)" };
 
-// The fluid itself: equation of state, its stiffness and rest density, and the SPH smoothing radius.
-// (Particle size and color live in the Scene tab; groups own the layout.)
+// The fluid itself: equation of state, stiffness, rest density and smoothing radius.
 static void DrawFluidSection(SceneParticles& pr, float contentWidth) {
     int eosIdx = static_cast<int>(pr.eos);
     FormRow(contentWidth, "Equation of state");
@@ -597,15 +533,13 @@ static void DrawViscositySection(SceneParticles& pr, float contentWidth) {
     }
 }
 
-// Defined further down (needs ScreenHalfWidth/Height); forward-declared so AdvanceSimulation can
-// call it despite living earlier in the file, next to the other pause/step/menu logic.
+// Defined further down (needs ScreenHalfWidth/Height); forward-declared for AdvanceSimulation.
 static bool Integrate(float subDt);
 
 // ---- Events (see SceneEvent) -------------------------------------------------------------------
-static bool       showEventAreas     = true;  // draw event gizmos over the live view (ImGui only, never recorded)
+static bool       showEventAreas     = true;  // draw event gizmos over the live view (never recorded)
 static SceneEvent placeEventTemplate = [] { SceneEvent e; e.accel = Vec2(400.f, 0.f); return e; }();
-// Whether each ActiveScene.events[i] of mode Once has already fired this run. Kept parallel to the
-// live list (the live editor inserts/erases in step) and reset by ResetSimulation.
+// Whether each Once event has fired this run. Parallel to ActiveScene.events; reset by ResetSimulation.
 static std::vector<char> eventFired;
 
 static bool InsideEvent(const SceneEvent& e, const Vec2& p) {
@@ -614,7 +548,7 @@ static bool InsideEvent(const SceneEvent& e, const Vec2& p) {
     return std::fabs(dx) <= e.halfW && std::fabs(dy) <= e.halfH;
 }
 
-// Adds each due Once event's velocity delta to every particle inside its area — once per run.
+// Adds each due Once event's velocity delta to every particle inside its area, once per run.
 static void ApplyOnceEvents() {
     const auto& events = ActiveScene.events;
     eventFired.resize(events.size(), 0);
@@ -627,8 +561,8 @@ static void ApplyOnceEvents() {
     }
 }
 
-// Applies every Continuous event active at sim time `t` as an acceleration over `subDt`. Goes
-// straight onto vel (not acc) because acc is only zeroed/recomputed every forceInterval substeps.
+// Applies every Continuous event active at sim time `t` as an acceleration over `subDt`. Goes onto
+// vel, not acc, because acc is only recomputed every forceInterval substeps.
 static void ApplyContinuousEvents(double t, float subDt) {
     for (const SceneEvent& e : ActiveScene.events) {
         if ((e.mode != EventMode::Continuous && e.mode != EventMode::Field) || t < e.startTime) continue;
@@ -696,29 +630,25 @@ static void DrawEventFields(SceneEvent& e, float contentWidth) {
     }
 }
 
-// The container's half-extents (for scenes sized from the window rather than in absolute pixels)
-// are measured once per run, in ResetSimulation, and held until the run ends -- so resizing the
-// window or the docked panels mid-run can't move the walls under the particles (which would crush
-// the fluid against a suddenly smaller box and blow the sim up). <= 0 = not frozen (menu).
+// Window-sized container half-extents are measured once per run in ResetSimulation, so resizing
+// mid-run can't move the walls under the particles. <= 0 = not frozen (menu).
 static float frozenHalfW = 0.f, frozenHalfH = 0.f;
 
-// `fullWindow`: measure against the whole window (recordings and batch renders, which are drawn
-// full-frame) instead of the free area between the docked panels (a plain live run).
+// `fullWindow`: measure against the whole window (recordings and batch renders) instead of the
+// free area between the docked panels.
 // ---- Sim thread ---------------------------------------------------------------------------------
-// Live (Running) physics runs on a worker thread so a slow, hung or diverging sim can never freeze
-// the window. The UI/render thread asks for time to be simulated; the worker advances it.
+// Live (Running) physics runs on a worker thread so a slow or diverging sim can't freeze the
+// window. The UI thread asks for time to be simulated; the worker advances it.
 //
 // simMutex guards all simulation state (objects, ActiveScene, eventFired, simTime, cameraOffsetX,
-// profileLogger sampling, the fault message). The worker holds it while it computes a substep and
-// releases it between substeps; the UI thread holds it while it draws the UI or reads particles,
-// and asks the worker to yield first (uiWaiting) so it waits at most one substep. If the lock can't
-// be taken in time the UI shows a "not responding" notice instead of touching sim state.
-// Rendering (batch) mode calls AdvanceSimulation straight from the main thread; the same lock keeps
-// it correct and is simply uncontended there.
+// profileLogger sampling, the fault message). The worker holds it during a substep and releases it
+// between substeps; the UI thread asks the worker to yield (uiWaiting) so it waits at most one
+// substep. If the lock can't be taken in time the UI shows a "not responding" notice instead.
+// Batch rendering calls AdvanceSimulation from the main thread, where the lock is uncontended.
 static std::timed_mutex          simMutex;
 static std::atomic<int>          uiWaiting{ 0 };
 static std::atomic<uint32_t>     simGeneration{ 0 }; // bumped by ResetSimulation; a step in flight abandons itself
-static std::atomic<bool>         simAbort{ false };  // set at shutdown so the worker stops at the next substep
+static std::atomic<bool>         simAbort{ false };  // set at shutdown; the worker stops at the next substep
 static std::atomic<bool>         simFaulted{ false };
 static std::string               simFaultMessage;    // guarded by simMutex
 
@@ -729,15 +659,15 @@ static int                       workManualSteps    = 0;   // StepDt-sized steps
 static bool                      workQuit           = false;
 static std::thread               simThread;
 static std::atomic<bool>         simThreadExited{ false };
-static std::atomic<float>        simStepMs{ 0.f }; // smoothed wall time of one worker step, for the live panel's "Compute"
-static std::atomic<float>        simSpeed{ 1.f };  // smoothed fraction of real time the sim keeps up with (1 = real time)
-static float                     renderCpuMs  = 0.f; // UI thread only: smoothed draw/submit time, excluding GPU/vsync/sim-lock waits
-static float                     lockWaitMs   = 0.f; // UI thread only: time LockSim waited this frame
+static std::atomic<float>        simStepMs{ 0.f }; // smoothed wall time of one worker step ("Compute")
+static std::atomic<float>        simSpeed{ 1.f };  // smoothed fraction of real time the sim keeps up with
+static float                     renderCpuMs  = 0.f; // UI thread: smoothed draw/submit time, excluding waits
+static float                     lockWaitMs   = 0.f; // UI thread: time LockSim waited this frame
 
 using SimLock = std::unique_lock<std::timed_mutex>;
 
-// Takes simMutex for the UI thread, making the worker yield. False if the worker is stuck inside a
-// single substep for longer than `timeoutMs` — the caller must then not touch any sim state.
+// Takes simMutex for the UI thread, making the worker yield. False if the worker is stuck in a
+// single substep longer than `timeoutMs`; the caller must then not touch sim state.
 static bool LockSim(SimLock& lk, int timeoutMs = 100) {
     const auto start = std::chrono::steady_clock::now();
     uiWaiting++;
@@ -776,32 +706,25 @@ static void ResetSimulation(bool fullWindow) {
     }
     Init();
     eventFired.assign(ActiveScene.events.size(), 0);
-    runIndex++;
     paused = false;
     cameraOffsetX = 0.f;
-    // A restarted sim starts again from t = 0, so an in-progress profile would get a second,
-    // overlapping time series appended to it — end it instead. (StartRun starts a fresh one after
-    // its own ResetSimulation call.)
+    // A restart begins again at t = 0, so end any in-progress profile (StartRun starts a fresh one).
     profileLogger.Stop();
     simTime = 0.0;
 }
 
-// Advances one substep loop's worth of physics by dt — factored out of the main loop so manual
-// stepping (paused, one keypress/button = one frame) runs the exact same code path as normal
-// per-frame advancement, just with a fixed dt instead of the frame's real one.
+// Advances physics by dt. Shared by normal advancement and manual stepping (which uses a fixed dt).
 static void AdvanceSimulationLocked(float dt) {
     SimLock lk(simMutex);
     if (simFaulted) return;
     const uint32_t generation = simGeneration;
-    // Force is recomputed every forceInterval substeps (not once per frame, not every substep) —
-    // see Integrate()'s comment for why a stale force is a real energy-gain source, and why
-    // recomputing every substep was too expensive at this particle count.
+    // Force is recomputed every forceInterval substeps (see Integrate() on stale-force energy gain).
     const int   substeps = std::max(ActiveScene.physics.substeps, 1);
     const float subDt    = dt / static_cast<float>(substeps);
     ApplyOnceEvents();
     for (int step = 0; step < substeps; step++) {
         if (step > 0) {
-            // Between substeps the state is consistent: let the UI thread in if it's waiting.
+            // State is consistent between substeps: let a waiting UI thread in.
             lk.unlock();
             while (uiWaiting.load() > 0 && !simAbort) std::this_thread::sleep_for(std::chrono::microseconds(50));
             lk.lock();
@@ -819,15 +742,14 @@ static void AdvanceSimulationLocked(float dt) {
     }
 
     simTime += dt;
-    // A loop, not an if: dt can span several sample periods when the profile rate exceeds the step
-    // rate (e.g. 60 Hz profile at a 30 fps batch render), and one sample per call would let the
-    // frame counter fall behind the time column.
+    // A loop, not an if: dt can span several sample periods (e.g. a 60 Hz profile in a 30 fps
+    // batch render).
     while (profileLogger.IsActive() && simTime + 1e-6 >= profileLogger.NextSampleTime())
         profileLogger.Sample();
 }
 
-// Never lets an exception escape into the caller (the worker thread would otherwise terminate the
-// process): any failure becomes a fault the UI reports, and the sim just stops advancing.
+// Never lets an exception escape (it would terminate the worker thread and the process): any
+// failure becomes a fault the UI reports, and the sim stops advancing.
 static void AdvanceSimulation(float dt) {
     try {
         AdvanceSimulationLocked(dt);
@@ -857,11 +779,11 @@ static void SimWorkerMain() {
         } else {
             AdvanceSimulation(static_cast<float>(dt));
         }
-        // Per call (not per manual step): a Step x10 burst reads as one long step, which is honest.
+        // Per call, not per manual step: a Step x10 burst counts as one long step.
         const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
         simStepMs = simStepMs * 0.9f + ms * 0.1f;
-        // Simulated seconds covered per wall second, capped at real time: under 100% means the sim
-        // can't keep up and runs in slow motion. Manual steps aren't paced, so they don't count.
+        // Simulated seconds per wall second, capped at real time; under 100% means slow motion.
+        // Manual steps aren't paced, so they don't count.
         if (manual == 0 && ms > 0.f) {
             const float speed = std::min(1.f, static_cast<float>(dt) / (ms * 0.001f));
             simSpeed = simSpeed * 0.9f + speed * 0.1f;
@@ -872,8 +794,8 @@ static void SimWorkerMain() {
 
 static void StartSimThread() { simThread = std::thread(SimWorkerMain); }
 
-// Stops the worker. If it's wedged inside a single substep it can't be joined, so it's detached
-// and the caller must exit the process without running static destructors (returns false).
+// Stops the worker. If it's wedged in a substep it is detached instead, and the caller must exit
+// without running static destructors (returns false).
 static bool StopSimThread() {
     simAbort = true;
     {
@@ -887,8 +809,8 @@ static bool StopSimThread() {
     return false;
 }
 
-// Asks the worker to simulate `dt` more seconds. Capped at one clamped frame, so a sim slower than
-// real time just runs in slow motion instead of building an ever-growing backlog.
+// Asks the worker to simulate `dt` more seconds, capped at one clamped frame so a slow sim runs
+// in slow motion instead of building a backlog.
 static void QueueSimTime(float dt) {
     {
         std::lock_guard<std::mutex> lk(workMutex);
@@ -907,32 +829,24 @@ static void QueueManualSteps(int count) {
 
 static void TogglePause() { paused = !paused; }
 
-// Stepping always pauses first (if not already) — pressing Step/the arrow keys while running
-// freezes the sim on that frame rather than requiring a separate pause press first.
+// Stepping pauses first, so Step/arrow keys freeze the sim on that frame.
 static void StepOnce() { paused = true; QueueManualSteps(1); }
 static void StepBig()  { paused = true; QueueManualSteps(BigStepFrames); }
 
-// The recording/data-save configuration currently driving Running/Rendering — set by StartRun so
-// AdvanceRendering's frame rate and DrawRenderingOverlay's progress display reflect whichever
-// entry (manual or queued) is actually active, not always menuConfig.run.
+// The run configuration currently driving Running/Rendering (manual or queued), set by StartRun.
 static RunSettings activeRun;
 
-// One queued run: a full Scene snapshot plus its own recording/data-save settings, captured by
-// value at "Add to Queue" time so later menu edits never retroactively change an already-queued
-// entry.
+// One queued run: a Scene snapshot plus its own output settings, captured by value so later menu
+// edits don't change it.
 struct QueueEntry {
     Scene       scene;
     RunSettings run;
 };
 static std::vector<QueueEntry> runQueue;
-static int  queueRunningIndex = -1; // -1 = no queue run in progress; runQueue itself is never
-                                     // cleared by that, so "Run Queue" can be pressed again after.
+static int  queueRunningIndex = -1; // -1 = no queue run in progress; runQueue itself is kept for re-running
 
-// A queued entry needs some condition that will actually end its batch run on its own, or the
-// queue would stall forever on it — checked at "Add to Queue" time (see DrawMenu's Run Queue
-// section).
-// Every enabled output must be finite (and at least one enabled): AdvanceRendering runs until
-// *all* outputs have stopped, so a single unlimited one would keep the queue stuck on this entry.
+// A queued entry needs a finite end or it would stall the queue. Every enabled output must be
+// finite (and at least one enabled), since AdvanceRendering runs until all outputs stop.
 static bool HasDeterministicEnd(const RunSettings& run) {
     if (!run.record && !run.saveData && !run.saveProfile) return false;
     return (!run.record      || run.lengthSeconds        > 0.f) &&
@@ -942,23 +856,17 @@ static bool HasDeterministicEnd(const RunSettings& run) {
 
 static void AdvanceQueue();
 
-// Loads `scene`, resets the sim, and starts whatever recording/data-save `run` requests — the
-// shared core behind a manual "Start Simulation" click and a queued entry's turn. `forceBatch` is
-// true for every queue entry (so a queued run is always unattended/offscreen, never live Running,
-// since only batch mode has a deterministic end) and false for a manual run, which uses its own
-// `run.batchRender` checkbox instead.
+// Loads `scene`, resets the sim, and starts the outputs `run` requests. Shared by a manual start
+// and queued entries. `forceBatch` is true for queue entries (only batch mode has a deterministic
+// end); a manual run uses `run.batchRender`.
 static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch) {
     LoadScene(scene);
     activeRun = run;
     ResetSimulation(/*fullWindow=*/run.record || forceBatch || run.batchRender);
 
-    // Shared by both outputs below, so a run's video and CSV carry the same run number and are
-    // recognizable as belonging to the same run at a glance.
-    //
-    // This generated name is the only default there is: a title (required in the UI, see
-    // RequireTitles) is appended to it, and a blank or unsanitizable one — however it got past the
-    // UI check — just leaves the generated name as is. The particle count is the spawned one
-    // (after obstacle culling), since ResetSimulation has just run.
+    // Shared by both outputs so a run's video and CSV carry the same run number. A title is
+    // appended to it; a blank or unsanitizable one leaves the generated name as is. The particle
+    // count is the spawned one (after obstacle culling).
     auto withTitle = [](std::string name, const char* title) {
         const std::string clean = SanitizeFilename(title, "");
         return clean.empty() ? name : name + "_" + clean;
@@ -976,8 +884,7 @@ static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch
     bool dataStarted = false;
 
     if (run.record) {
-        // Sanitized here too (StartRecording does it again, idempotently) so the existence check
-        // below looks at the exact path that will be written, e.g. when %g put a '+' in the name.
+        // Sanitized here too (idempotent) so the existence check sees the exact path written.
         std::string name = SanitizeFilename(withTitle(runBase, run.title), runBase.c_str());
         name = RunNaming::EnsureUniqueBaseName(name, { { ExecutableDir() / "recordings", ".mp4" } });
         recording = app.StartRecording(name, run.fps, run.lengthSeconds);
@@ -1011,8 +918,7 @@ static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch
         const auto  dir = ExecutableDir() / "data";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
-        // Viscosity model + its parameter in the name, since RunNaming's base name doesn't carry
-        // them and they're what distinguishes one Poiseuille run from the next.
+        // Viscosity model + parameter go in the name, since RunNaming's base name omits them.
         const auto& p = scene.particles;
         char tag[96];
         if (p.viscosityModel == ViscosityModel::Morris)
@@ -1030,9 +936,8 @@ static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch
     // output failed to start (e.g. ffmpeg missing and a disk error), fall back to Running rather
     // than a Rendering state AdvanceRendering would find already finished.
     if ((forceBatch || run.batchRender) && (recording || dataStarted || profileStarted)) {
-        // AdvanceRendering captures every video frame itself via RenderOffscreenFrame; the
-        // per-tick RenderFrame() call (see main()) is only there to keep the progress overlay on
-        // screen and must not also feed the recorder — see SetCaptureFromSwapchain.
+        // AdvanceRendering captures frames via RenderOffscreenFrame; the per-tick RenderFrame()
+        // only refreshes the overlay and must not feed the recorder (see SetCaptureFromSwapchain).
         app.SetCaptureFromSwapchain(false);
         appState = AppState::Rendering;
     } else {
@@ -1044,9 +949,8 @@ static void StartSimulationFromMenu() {
     StartRun(menuConfig.scene, menuConfig.run, /*forceBatch=*/false);
 }
 
-// Starts queue entry `entry` in forced-batch mode; if it fails to actually start anything (see
-// StartRun's fallback), immediately advances past it instead of stalling in Running with no
-// auto-advance path (AdvanceQueue is only reachable from AdvanceRendering).
+// Starts queue entry `entry` in forced-batch mode; if nothing actually starts (see StartRun's
+// fallback), advances past it, since AdvanceQueue is only reachable from AdvanceRendering.
 static void StartQueueEntry(const QueueEntry& entry) {
     StartRun(entry.scene, entry.run, /*forceBatch=*/true);
     if (appState != AppState::Rendering) AdvanceQueue();
@@ -1058,28 +962,25 @@ static void StartQueue() {
     StartQueueEntry(runQueue[0]);
 }
 
-// Resets the sim in place without leaving Running (and without touching any active recording or
-// data save) — distinct from ReturnToMenu, which is the "stop and reconfigure" path.
+// Resets the sim in place without leaving Running or touching active outputs (unlike ReturnToMenu).
 static void RestartSimulation() {
     ResetSimulation(activeRun.record || activeRun.batchRender || queueRunningIndex >= 0);
 }
 
 static void ReturnToMenu() {
-    queueRunningIndex = -1; // abort the rest of the queue, if any; runQueue itself stays intact
+    queueRunningIndex = -1; // abort the rest of the queue; runQueue itself stays intact
     frozenHalfW = frozenHalfH = 0.f;
     app.StopRecording();
     dataRecorder.Stop();
     profileLogger.Stop();
     objects.clear();
-    // Restore the default so the next live recording (Running, not batchRender) captures normally
-    // — only batch rendering ever turns this off.
+    // Restore the default so the next live recording captures normally; only batch rendering turns this off.
     app.SetCaptureFromSwapchain(true);
     appState = AppState::Menu;
 }
 
-// Stops whatever the just-finished queue entry left active and starts the next one, or returns to
-// Menu once the queue is exhausted — mirrors ReturnToMenu's stop calls but leaves runQueue itself
-// intact, so "Run Queue" can be pressed again afterward.
+// Stops what the finished queue entry left active and starts the next, or returns to Menu once
+// the queue is exhausted. Leaves runQueue intact so it can be run again.
 static void AdvanceQueue() {
     app.StopRecording();
     dataRecorder.Stop();
@@ -1097,23 +998,20 @@ static void AdvanceQueue() {
 }
 
 // ================================================================================================
-// Docked-panel UI. One top bar, a left panel (Setup tabs / live view controls / render progress,
-// depending on appState), a right panel (events list + inspector) and the sim view in the free
-// center area, which also hosts the event gizmos (see ui/EventGizmo.h). All of it is drawn by
-// DrawUi(), the single UI callback.
+// Docked-panel UI: a top bar, a left panel (setup tabs / live controls / render progress by
+// appState), a right panel (events) and the sim view in the center, which also hosts the event
+// gizmos (see ui/EventGizmo.h). All drawn by DrawUi(), the single UI callback.
 // ================================================================================================
 
 // Index into UiEvents() of the event the right panel inspects and the gizmo highlights.
 static int selectedEvent = -1;
 
-// The event list the panels/gizmo edit: the menu's scene before a run, the live scene during one
-// (so live edits take effect immediately and never touch the menu's copy).
+// The event list the panels/gizmo edit: the menu's scene before a run, the live scene during one.
 static std::vector<SceneEvent>& UiEvents() {
     return appState == AppState::Menu ? menuConfig.scene.events : ActiveScene.events;
 }
 
-// A tinted, rounded "card" grouping a few related rows. Widths inside should come from
-// GetContentRegionAvail() so they follow the panel's (user-resizable) width.
+// A tinted, rounded "card" grouping related rows. Take widths from GetContentRegionAvail().
 static void BeginCard(const char* id) {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, Theme::PanelAlt);
     ImGui::BeginChild(id, ImVec2(0.f, 0.f),
@@ -1126,16 +1024,14 @@ static void EndCard() {
 
 // ---- Setup tabs (Menu state) ----------------------------------------------------------------
 
-// Container half-extents as the setup view shows them (same rule as the preview in DrawSimOverlay).
+// Container half-extents as the setup view shows them (same rule as DrawSimOverlay's preview).
 static void MenuHalfExtents(const Scene& s, float& halfW, float& halfH) {
     halfW = s.boundary.halfWidthPx  > 0.f ? s.boundary.halfWidthPx  : app.RecordingHalfWidth()  * s.boundary.widthFrac;
     halfH = s.boundary.halfHeightPx > 0.f ? s.boundary.halfHeightPx : app.RecordingHalfHeight() * s.boundary.heightFrac;
 }
 
-// Seeds the scene's editable particle groups from its legacy spawn block (grid counts, circular,
-// offset, packing), so a built-in or older preset shows up as one group that can be moved, resized
-// or deleted. Called when a scene is loaded and whenever one of those block controls is edited
-// (which therefore regenerates the groups).
+// Seeds the scene's editable groups from its spawn block (grid counts, circular, offset, packing).
+// Called when a scene loads and whenever one of those block controls is edited.
 static void SyncGroupsFromSpawn(Scene& s) {
     float halfW, halfH;
     MenuHalfExtents(s, halfW, halfH);
@@ -1143,8 +1039,8 @@ static void SyncGroupsFromSpawn(Scene& s) {
     s.useGroups = true;
 }
 
-// Which scene index menuConfig.scene was last seeded from (-1 = never), so a scene change is told
-// apart from ordinary frames; also re-pointed by "Save Current as Preset" so saving doesn't reseed.
+// Which scene index menuConfig.scene was last seeded from (-1 = never); "Save Current as Preset"
+// re-points it so saving doesn't reseed.
 static int lastSyncedSceneIndex = -1;
 
 static void DrawSceneTab() {
@@ -1167,10 +1063,8 @@ static void DrawSceneTab() {
     }
     ImGui::TextUnformatted(CombinedDescription(menuConfig.sceneIndex).c_str());
 
-    // Reseeds menuConfig.scene from scratch (the preset factory, or the preset file) whenever the
-    // scene selection changes this frame — including the very first DrawMenu call, since
-    // lastSyncedSceneIndex starts at a value no real sceneIndex can equal. Every other field is
-    // left exactly as the user last edited it on every other frame; see the sections below.
+    // Reseeds menuConfig.scene (from the preset factory or file) when the scene selection changes,
+    // including the first call. Other frames leave the user's edits alone.
     if (menuConfig.sceneIndex != lastSyncedSceneIndex) {
         bool loadedOk = true;
         if (CombinedIsBuiltin(menuConfig.sceneIndex)) {
@@ -1187,8 +1081,7 @@ static void DrawSceneTab() {
             lastSyncedSceneIndex = menuConfig.sceneIndex;
             if (!menuConfig.scene.useGroups) SyncGroupsFromSpawn(menuConfig.scene);
         } else {
-            // The preset file is gone/unreadable: fall back to the first built-in and rescan so
-            // the combo and the scene fields agree again instead of showing the dead selection.
+            // The preset file is gone/unreadable: fall back to the first built-in and rescan.
             RefreshUserPresets();
             menuConfig.sceneIndex = 0;
             menuConfig.scene = BuildScene(0, ScenePresets[0].spawn.gridCountX, ScenePresets[0].spawn.gridCountY);
@@ -1203,8 +1096,7 @@ static void DrawSceneTab() {
     EndCard();
     }
 
-    // Particle size and base color live here only: the size sets every group's lattice spacing (with
-    // its own packing), so it must not be editable from a second place.
+    // Particle size and base color live here only; the size sets every group's lattice spacing.
     Widgets::Caption("PARTICLES");
     BeginCard("##particleCard");
     {
@@ -1236,9 +1128,8 @@ static void DrawSceneTab() {
             if (!ec) {
                 std::string safeName = SanitizeFilename(presetSaveName, "preset");
                 std::string displayName = presetSaveName;
-                // Re-saving over the preset currently selected is an intentional in-place update;
-                // anything else that would land on an existing file gets a numeric suffix instead
-                // of silently clobbering it.
+                // Re-saving the selected preset updates it in place; anything else landing on an
+                // existing file gets a numeric suffix.
                 const bool selectedIsUser = !CombinedIsBuiltin(menuConfig.sceneIndex) &&
                     menuConfig.sceneIndex - static_cast<int>(ScenePresets.size()) < static_cast<int>(userPresets.size());
                 const bool overwritingSelected = selectedIsUser &&
@@ -1256,10 +1147,8 @@ static void DrawSceneTab() {
                 SaveScenePreset(presetPath, menuConfig.scene);
                 RefreshUserPresets();
 
-                // ScanUserPresets sorts by name, so re-scanning can shift every user preset's
-                // index — re-point sceneIndex (and lastSyncedSceneIndex, to match, so this
-                // doesn't itself trigger a reseed) at the just-saved file instead of leaving it
-                // aimed at whatever now sits at the old index.
+                // Re-scanning can shift user preset indices, so re-point sceneIndex (and
+                // lastSyncedSceneIndex, to avoid a reseed) at the just-saved file.
                 for (int i = 0; i < static_cast<int>(userPresets.size()); i++) {
                     if (userPresets[i].path == presetPath) {
                         menuConfig.sceneIndex = static_cast<int>(ScenePresets.size()) + i;
@@ -1296,9 +1185,8 @@ static void DrawPhysicsTab() {
     ImGui::PopTextWrapPos();
 }
 
-// Every enabled output (video, CSV data, velocity profile) must be given a title, which becomes
-// part of its file name. Starting (or queueing) a run without one jumps to the Output tab and marks
-// the empty fields instead of going ahead.
+// Every enabled output (video, CSV data, velocity profile) needs a title for its file name. A
+// start or queue without one jumps to the Output tab and marks the empty fields.
 static bool TitleBlank(const char* s) {
     for (; *s; ++s)
         if (!std::isspace(static_cast<unsigned char>(*s))) return false;
@@ -1310,7 +1198,7 @@ static bool MissingTitles(const RunSettings& r) {
 }
 
 static bool showTitleErrors = false; // mark empty required titles (after a refused Start)
-static int  requestedTab    = -1;    // setup tab to switch to on the next frame (index into DrawSetupPanel's tabs)
+static int  requestedTab    = -1;    // setup tab to switch to next frame (index into DrawSetupPanel's tabs)
 constexpr int OutputTabIndex = 2;
 
 static bool RequireTitles(const RunSettings& r) {
@@ -1336,14 +1224,12 @@ static void DrawTitleInput(float w, const char* label, const char* id, char* buf
 
 static void DrawQueueSection();
 
-// Everything about a run's output in one place: how particles are colored, what gets saved, and the
-// queue of runs built from those settings.
+// A run's output settings: particle coloring, what gets saved, and the run queue.
 static void DrawOutputTab() {
     const float w = ImGui::GetContentRegionAvail().x;
     ImGui::PushTextWrapPos(0.f);
 
-    // Always available (not tied to recording) so velocity/density gradient coloring can be set up
-    // before a run starts, including for batch renders that never visit the live view.
+    // Always available so coloring can be set up before a run, including for batch renders.
     Widgets::Caption("APPEARANCE");
     if (ImGui::CollapsingHeader("Color by")) DrawColorByControls(w);
 
@@ -1451,12 +1337,11 @@ static void DrawQueueSection() {
 
 static void DrawSetupPanel() {
     const ImGuiStyle& style = ImGui::GetStyle();
-    // Sticky footer: the tab content above scrolls, the particle readout and Start button never do.
+    // Sticky footer: the tab content above scrolls; the particle readout and Start button don't.
     const float buttonH = ImGui::GetFrameHeight() * 1.5f;
     const float footerH = buttonH + ImGui::GetTextLineHeight() + style.ItemSpacing.y * 3.f;
 
-    // Errors clear themselves once every required title has been filled in, so enabling another
-    // output later doesn't start out marked red.
+    // Errors clear once every required title is filled in, so a newly enabled output doesn't start red.
     if (showTitleErrors && !MissingTitles(menuConfig.run)) showTitleErrors = false;
 
     if (ImGui::BeginTabBar("##setupTabs")) {
@@ -1465,7 +1350,7 @@ static void DrawSetupPanel() {
                              { "Output", DrawOutputTab } };
         for (const Tab& t : tabs) {
             const int index = static_cast<int>(&t - tabs);
-            // A refused Start asks for the Output tab: SetSelected on the frame it's requested.
+            // A refused Start selects the Output tab via SetSelected on the requesting frame.
             const ImGuiTabItemFlags flags = index == requestedTab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
             if (!ImGui::BeginTabItem(t.name, nullptr, flags)) continue;
             ImGui::BeginChild("##tabScroll", ImVec2(0.f, -footerH));
@@ -1493,7 +1378,7 @@ static void DrawLivePanel() {
 
     Widgets::Caption("RUN");
     BeginCard("##runCard");
-    // Label on the left, value right-aligned to the card's edge so the numbers line up.
+    // Label on the left, value right-aligned to the card's edge.
     auto statRow = [](const char* label, const char* value, const ImVec4* color = nullptr) {
         ImGui::TextUnformatted(label);
         ImGui::SameLine();
@@ -1507,10 +1392,9 @@ static void DrawLivePanel() {
     statRow("Simulated time", buf);
     std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(objects.size()));
     statRow("Particles", buf);
-    // The sim and the renderer run side by side, so these don't add up: Frame is the length of one
-    // frame (vsync-limited), Compute is how long the sim thread takes per step, Render is the UI
-    // thread's own drawing work with the GPU/vsync waits taken out, and Sim speed is how much of
-    // real time the sim keeps up with (under 100% = slow motion).
+    // The sim and renderer run side by side, so these don't add up: Frame is one (vsync-limited)
+    // frame, Compute is the sim thread's time per step, Render is the UI thread's drawing work
+    // without GPU/vsync waits, and Sim speed is the fraction of real time the sim keeps up with.
     const Profiler::Stats& perf = profiler.GetStats();
     std::snprintf(buf, sizeof(buf), "%.0f", perf.fps);
     statRow("FPS", buf);
@@ -1531,8 +1415,7 @@ static void DrawLivePanel() {
     ImGui::TextDisabled("Space: pause  |  Right: step  |  Left: step x10");
     if (simFaulted) {
         ImGui::Spacing();
-        // TextWrapped wraps at the card's own content edge; the outer PushTextWrapPos(0) in this
-        // panel wraps at the parent window's edge, which lies past the card and clipped the text.
+        // TextWrapped wraps at the card's content edge; the panel's outer PushTextWrapPos(0) would clip.
         ImGui::PushStyleColor(ImGuiCol_Text, Theme::Coral);
         ImGui::TextWrapped("%s", simFaultMessage.c_str());
         ImGui::PopStyleColor();
@@ -1559,8 +1442,7 @@ static void DrawLivePanel() {
 
 // ---- Render progress (Rendering state) ------------------------------------------------------
 
-// Safe to draw now that VulkanContext::RenderFrame captures the video frame in a first pass and
-// only draws ImGui in a second one on top — this never reaches the recorded video.
+// Never reaches the recorded video: RenderFrame captures the scene pass before drawing ImGui.
 static void DrawRenderingPanel() {
     const float w = ImGui::GetContentRegionAvail().x;
     ImGui::PushTextWrapPos(0.f);
@@ -1570,8 +1452,7 @@ static void DrawRenderingPanel() {
     ImGui::TextUnformatted(ActiveScene.name.c_str());
     ImGui::Spacing();
 
-    // A data-only queue entry (no video) never sets app.IsRecording() — track its own elapsed
-    // time via the data-save sample count instead, same source the "DATA" chip uses.
+    // A data-only entry never sets app.IsRecording(), so track elapsed time via the data-save sample count.
     if (app.IsRecording()) {
         const float recorded = app.RecordedSeconds();
         if (activeRun.lengthSeconds > 0.f) {
@@ -1657,8 +1538,8 @@ static void RemoveEventAt(std::vector<SceneEvent>& events, int index) {
     selectedEvent = -1;
 }
 
-// Result of the async "Browse..." dialog; SDL may call back from another thread, so hand it over
-// through a mutex and let the UI pick it up next frame.
+// Result of the async "Browse..." dialog; SDL may call back on another thread, so it is handed
+// over through a mutex.
 static std::mutex  pickedImageMutex;
 static std::string pickedImagePath;
 
@@ -1719,8 +1600,7 @@ static void DrawColorPatternSection(SceneColorPattern& p, float w) {
 static void DrawColorRegionsPanel() {
     {
         const float pw = ImGui::GetContentRegionAvail().x;
-        // The base particle color is set in the Scene tab (and per group in the Groups tab); this
-        // panel only paints over it.
+        // The base color is set in the Scene tab and per group; this panel only paints over it.
         Widgets::Caption("PATTERN");
         DrawColorPatternSection(menuConfig.scene.colorPattern, pw);
         ImGui::Spacing();
@@ -2093,11 +1973,9 @@ static void DrawEventsPanel() {
 
 // ---- Sim view: scene preview (setup) + event gizmos -----------------------------------------
 
-// Draws/edits a list of shapes (SceneColorRegion or SceneObstacle — same geometry + color fields)
-// through SceneEvent proxies so the events gizmo can drag them. Only interactive when `edit`;
-// otherwise it just draws them so they stay visible behind the other tab.
-// `fixedTint` (optional) replaces every shape's own color, `fillScale` thins the fill so what's
-// underneath (e.g. the preview particles under a group) stays visible.
+// Draws/edits a list of shapes (SceneColorRegion or SceneObstacle) through SceneEvent proxies so
+// the events gizmo can drag them. Only interactive when `edit`. `fixedTint` (optional) replaces
+// every shape's color; `fillScale` thins the fill so what's underneath stays visible.
 template <typename Shape>
 static void RunShapeGizmo(std::vector<Shape>& list, const Shape& place, int& selected, bool edit,
                           const EventGizmo::View& view, const char* label,
@@ -2143,15 +2021,14 @@ static void RunShapeGizmo(std::vector<Shape>& list, const Shape& place, int& sel
 
 // ---- Setup-view particle preview ---------------------------------------------------------------
 // While configuring, every particle the scene would spawn is drawn at its real size, spacing and
-// color — through the same instanced circle path as the sim, with no physics, so it stays instant
-// while you drag a group or change particle radius/packing/count. Mirrors Init()'s layout rules.
+// color through the sim's instanced circle path, with no physics. Mirrors Init()'s layout rules.
 
 constexpr int PreviewParticleCap = 100000; // the renderer's instance capacity (VulkanContext kMaxObjects)
 
-// The groups the menu shows: the scene's own, or (before the menu has seeded them) the legacy block.
+// The groups the menu shows: the scene's own, or (before the menu seeds them) the spawn block.
 static std::vector<SceneGroup> MenuPreviewGroups(const Scene& s, float halfW, float halfH) {
     if (s.useGroups) return s.groups;
-    Scene tmp = s; // SpawnBlockAsGroup writes the derived grid counts back into its scene
+    Scene tmp = s; // SpawnBlockAsGroup writes the grid counts back into its scene
     return { SpawnBlockAsGroup(tmp, halfW, halfH) };
 }
 
@@ -2179,7 +2056,7 @@ static void AddMenuPreviewParticles() {
     MenuHalfExtents(s, halfW, halfH);
     const std::vector<SceneGroup> groups = MenuPreviewGroups(s, halfW, halfH);
 
-    // The box every group fits in — the frame a color pattern is laid over (as in Init()).
+    // The box every group fits in: the frame a color pattern is laid over (as in Init()).
     float boxMinX = 0.f, boxMinY = 0.f, boxMaxX = 0.f, boxMaxY = 0.f;
     bool  boxSet = false;
     for (const SceneGroup& g : groups) {
@@ -2207,8 +2084,7 @@ static void AddMenuPreviewParticles() {
     }
 }
 
-// Keeps the smallest shape of `list` containing (x, y) in `best` (smaller = more specific, so a
-// small obstacle inside a big group wins over the group).
+// Keeps the smallest shape of `list` containing (x, y) in `best`, so a small obstacle inside a big group wins.
 template <typename Shape>
 static void PickSmallestHit(const std::vector<Shape>& list, float x, float y, int layer,
                             int& bestLayer, int& bestIndex, float& bestArea) {
@@ -2224,12 +2100,10 @@ static void PickSmallestHit(const std::vector<Shape>& list, float x, float y, in
 }
 
 // Setup view: double-clicking any group, obstacle, color area or event selects it and brings its
-// tab to the front in the right panel, whichever tab is open (a single click only works on the
-// layer of the open tab).
+// tab to the front (a single click only works on the open tab's layer).
 static void SelectShapeOnDoubleClick(const EventGizmo::View& view) {
     const ImGuiIO& io = ImGui::GetIO();
-    // The raw per-frame flag, not IsMouseDoubleClicked(): that one also asks ImGui's key-owner
-    // system, which can veto the click when a widget claimed the mouse this frame.
+    // The raw per-frame flag, not IsMouseDoubleClicked(), which ImGui's key-owner system can veto.
     if (!io.MouseDoubleClicked[ImGuiMouseButton_Left]) return;
     const bool inView = io.MousePos.x >= view.clipMin.x && io.MousePos.x <= view.clipMax.x &&
                         io.MousePos.y >= view.clipMin.y && io.MousePos.y <= view.clipMax.y;
@@ -2246,7 +2120,7 @@ static void SelectShapeOnDoubleClick(const EventGizmo::View& view) {
     PickSmallestHit(s.colorRegions, wx, wy, 2, bestLayer, bestIndex, bestArea);
     PickSmallestHit(s.events,       wx, wy, 3, bestLayer, bestIndex, bestArea);
 
-    // Brings a docked panel's tab to the front (SetWindowFocus alone doesn't always reselect it).
+    // Brings a docked panel's tab to the front (SetWindowFocus alone may not reselect it).
     auto showTab = [](const char* name) {
         ImGuiWindow* w = ImGui::FindWindowByName(name);
         if (!w) return;
@@ -2267,8 +2141,7 @@ static void DrawSimOverlay(const Workspace::Frame& frame) {
     const ImGuiIO& io = ImGui::GetIO();
     const float fb = std::max(io.DisplayFramebufferScale.x, 0.01f); // framebuffer pixels per ImGui point
 
-    // The sim is rendered into the free center area (see VulkanContext::SetSceneViewport); the
-    // renderer ignores this while a recording is active and reports the window center instead.
+    // The sim renders into the free center area (see VulkanContext::SetSceneViewport); ignored while recording.
     app.SetSceneViewport(frame.centerMin.x * fb, frame.centerMin.y * fb,
                          (frame.centerMax.x - frame.centerMin.x) * fb,
                          (frame.centerMax.y - frame.centerMin.y) * fb);
@@ -2282,8 +2155,7 @@ static void DrawSimOverlay(const Workspace::Frame& frame) {
     view.clipMax = frame.centerMax;
 
     if (appState == AppState::Menu) {
-        // Pre-run preview: the container and the outline of each group, so events can be placed
-        // visually. The particles themselves are drawn by the renderer (AddMenuPreviewParticles).
+        // Pre-run preview: the container and each group's outline. The renderer draws the particles.
         const Scene& s = menuConfig.scene;
         float halfW, halfH;
         MenuHalfExtents(s, halfW, halfH);
@@ -2319,17 +2191,15 @@ static void DrawSimOverlay(const Workspace::Frame& frame) {
             view.cameraOffsetX = cameraOffsetX;
             view.wrapHalfWidth = ScreenHalfWidth();
         }
-        // Setup only: persistent-color areas, edited through SceneEvent proxies so the same gizmo can
-        // draw/drag them. Only interactive while the "Persistent Color" tab is open (the events gizmo
-        // below is then draw-only), and always drawn so they stay visible.
+        // Setup only: persistent-color areas, edited through SceneEvent proxies. Interactive only
+        // while the "Persistent Color" tab is open (the events gizmo is then draw-only).
         const bool editColors = appState == AppState::Menu && colorsTabActive;
         // Obstacles use the same proxy trick in their own tab.
         const bool editObstacles = appState == AppState::Menu && obstaclesTabActive;
         const bool editGroups    = appState == AppState::Menu && groupsTabActive;
         if (appState == AppState::Menu) {
             SelectShapeOnDoubleClick(view);
-            // Group boxes are a very light gray with a thin fill, so the particles inside keep
-            // their own colors in the preview.
+            // Light gray, thin fill, so the particles inside keep their own colors.
             static const ImVec4 GroupTint(0.88f, 0.88f, 0.90f, 1.f);
             RunShapeGizmo(menuConfig.scene.groups, placeGroupTemplate, selectedGroup, editGroups, view, "Group",
                           &GroupTint, 0.2f);
@@ -2417,8 +2287,7 @@ static void DrawTopBarContents() {
     }
 }
 
-// Drawn instead of DrawUi() when the worker thread is stuck inside a single substep and simMutex
-// can't be taken: it touches no sim state, so it's safe while the worker owns everything.
+// Drawn instead of DrawUi() when the worker is stuck in a substep and simMutex can't be taken. Touches no sim state.
 static void DrawUnresponsiveUi() {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -2432,9 +2301,8 @@ static void DrawUnresponsiveUi() {
     ImGui::End();
 }
 
-// The single UI callback (see main()): top bar, dockspace, the two panels, then the sim-view
-// overlay — in that order, so the gizmo's io.WantCaptureMouse check already knows about this
-// frame's panels.
+// The single UI callback: top bar, dockspace, panels, then the sim-view overlay, in that order so
+// the gizmo's io.WantCaptureMouse already reflects this frame's panels.
 static void DrawUi() {
     // A different run state or scene means the old selection no longer points at the same event.
     static AppState lastState = AppState::Menu;
@@ -2464,16 +2332,9 @@ Object& CreateObject(float x, float y, Renderable r) {
     return objects.back();
 }
 
-void RemoveObject(size_t i) {
-    objects[i] = objects.back();
-    objects.pop_back();
-}
-
-// The simulation container's half-extents — the active scene's boundary fractions applied to the
-// recording's own resolution while one is active (so the boundary/wall-bounce geometry can't
-// drift out from under a captured video frame that's pinned to a fixed size — see
-// VulkanContext::RecordingHalfWidth/Height), or the live window size otherwise. A scene that sets
-// SceneBoundary::halfWidthPx/halfHeightPx gets that exact size instead, independent of both.
+// The simulation container's half-extents: the scene's boundary fractions applied to the
+// recording's resolution while recording (see VulkanContext::RecordingHalfWidth/Height), or the
+// window size otherwise. SceneBoundary::halfWidthPx/halfHeightPx override both.
 float ScreenHalfWidth() {
     const auto& b = ActiveScene.boundary;
     if (b.halfWidthPx > 0.f) return b.halfWidthPx;
@@ -2485,20 +2346,17 @@ float ScreenHalfHeight() {
     return frozenHalfH > 0.f ? frozenHalfH : app.RecordingHalfHeight() * b.heightFrac;
 }
 
-// Draws a black frame at the active scene's boundary, so a container narrower than the window
-// (see SceneBoundary) reads as a wall instead of an invisible line partway across the screen.
-// AddRectOutline's border band is drawn inward from the half-extent passed in, so the rect is
-// inflated by BorderThickness here — that puts the band entirely outside the wall (half-extent
-// stays exactly where particles clamp) instead of eating into the fluid's play area.
+// Draws a black frame at the scene's boundary so a container narrower than the window reads as a
+// wall. AddRectOutline draws its border inward, so the rect is inflated by BorderThickness to put
+// the band entirely outside the wall.
 static void DrawBoundary(App& app) {
     constexpr float BorderThickness = 6.0f;
     constexpr Color BorderColor     = { 0.f, 0.f, 0.f, 1.f };
     const float hw = ScreenHalfWidth(), hh = ScreenHalfHeight();
 
     if (ActiveScene.boundary.periodicX) {
-        // No side walls to draw when X wraps — just solid top/bottom bars marking the channel's
-        // Y confinement. A border thickness bigger than the bar itself fills it solid rather than
-        // drawing it as a hollow frame (see AddRectOutline).
+        // No side walls when X wraps: just solid top/bottom bars. A border thicker than the bar
+        // fills it solid (see AddRectOutline).
         constexpr float FillSolid = 1e6f;
         const float barHalfHeight = BorderThickness * 0.5f;
         app.AddRectOutline(0.f,  hh + barHalfHeight, hw + BorderThickness, barHalfHeight, FillSolid, BorderColor);
@@ -2508,9 +2366,8 @@ static void DrawBoundary(App& app) {
     }
 }
 
-// Draws the scene's obstacles through the renderer (not ImGui), so they show in recordings too.
-// A rect is drawn as an outline thick enough to fill it solid (there is no filled-rect call), and
-// the shared rect budget (VulkanContext kMaxRects) leaves room for the boundary's own rects.
+// Draws the scene's obstacles through the renderer (not ImGui), so they show in recordings. A rect
+// is an outline thick enough to fill it solid (there is no filled-rect call).
 static float WrapX(float x, float hw); // defined below
 static void DrawObstacles(App& app, bool followCam, float hw) {
     constexpr size_t MaxObstacleRects = 56;
@@ -2525,9 +2382,8 @@ static void DrawObstacles(App& app, bool followCam, float hw) {
     }
 }
 
-// vt is the velocity component tangential to this axis's wall (e.g. vel.y when resolving the
-// x-axis walls); when noSlipWalls is enabled it gets damped on contact instead of passing
-// through untouched, so wall-adjacent particles drag against the boundary rather than free-slip.
+// vt is the velocity component tangential to this axis's wall (e.g. vel.y for the x-axis walls);
+// with noSlipWalls it is damped on contact.
 static void resolveAxis(float& p, float& v, float& vt, float half, float r) {
     const auto& physics = ActiveScene.physics;
     bool hit = false;
@@ -2536,9 +2392,9 @@ static void resolveAxis(float& p, float& v, float& vt, float half, float r) {
     if (hit && physics.noSlipWalls) vt *= 1.0f - physics.friction;
 }
 
-// Pushes a particle of radius r out of every obstacle it overlaps and, if it's moving into the
-// surface, reflects the normal velocity (restitution) and drags the tangential one when no-slip
-// walls are on — the same rules resolveAxis applies to the container walls.
+// Pushes a particle of radius r out of every overlapping obstacle and, if it's moving into the
+// surface, reflects the normal velocity and (with no-slip walls) drags the tangential one, as
+// resolveAxis does for the container walls.
 static void ResolveObstacles(Object& obj, float r) {
     const auto& physics = ActiveScene.physics;
     for (const SceneObstacle& o : ActiveScene.obstacles) {
@@ -2561,9 +2417,8 @@ static void ResolveObstacles(Object& obj, float r) {
     }
 }
 
-// Wraps x into (-hw, hw], the same range periodicX teleporting keeps simulated positions in —
-// used to fold the camera-follow display offset back into range regardless of how far it's
-// accumulated, rather than only handling a single wrap like the simulated-position teleport does.
+// Wraps x into (-hw, hw], the range periodicX keeps positions in. Unlike the single-wrap teleport,
+// it handles any accumulated camera-follow offset.
 static float WrapX(float x, float hw) {
     const float span = 2.f * hw;
     if (span <= 0.f) return x;
@@ -2572,19 +2427,17 @@ static float WrapX(float x, float hw) {
     return x - hw;
 }
 
-// Integrates a single substep, reusing whatever force (particle.acc) the last Update() call
-// computed — held constant across ActiveScene.physics.forceInterval substeps at a time to trade
-// some staleness back for compute cost. acc is reset only when it's about to be recomputed
-// (see the main loop), not here.
+// Integrates one substep, reusing the force (particle.acc) from the last Update(), held across
+// ActiveScene.physics.forceInterval substeps to trade staleness for compute. acc is reset only
+// when about to be recomputed, not here.
 //
-// Returns false if any particle came out non-finite or absurdly fast (the sim has diverged). Every
-// particle is still integrated, so the scan costs one pass-through's worth of compares, and the
-// caller decides what to do about it (see AdvanceSimulationLocked). Not compatible with -ffast-math,
-// which is allowed to optimize the isfinite test away.
+// Returns false if any particle came out non-finite or absurdly fast (the sim has diverged); every
+// particle is still integrated and the caller decides what to do (see AdvanceSimulationLocked).
+// Not compatible with -ffast-math, which may optimize the isfinite test away.
 static bool Integrate(float subDt) {
     const float hw = ScreenHalfWidth(), hh = ScreenHalfHeight();
     const bool  periodicX = ActiveScene.boundary.periodicX;
-    constexpr float MaxSpeedSq = 1.0e12f; // 1e6 px/s — far beyond anything a stable scene reaches
+    constexpr float MaxSpeedSq = 1.0e12f; // 1e6 px/s, far beyond any stable scene
     bool   finite = true;
     const bool hasObstacles = !ActiveScene.obstacles.empty();
     double sumVx = 0.0; // mean flow velocity this substep, for the camera-follow display offset
@@ -2593,8 +2446,7 @@ static bool Integrate(float subDt) {
         obj.vel += obj.acc * subDt;
         obj.pos += obj.vel * subDt;
         if (periodicX) {
-            // Teleport across the seam rather than bounce — velocity is left untouched, so the
-            // channel behaves like an infinite domain rather than a wall.
+            // Teleport across the seam rather than bounce; velocity is untouched.
             if      (obj.pos.x >  hw) obj.pos.x -= 2.f * hw;
             else if (obj.pos.x < -hw) obj.pos.x += 2.f * hw;
             sumVx += obj.vel.x;
@@ -2603,8 +2455,7 @@ static bool Integrate(float subDt) {
         }
         resolveAxis(obj.pos.y, obj.vel.y, obj.vel.x, hh, r);
         if (hasObstacles) {
-            // Obstacle, then walls again, then obstacle: a particle pinned between an obstacle and
-            // a wall ends up legal against both instead of being pushed through one by the other.
+            // Obstacle, walls, obstacle: a particle pinned between an obstacle and a wall ends up legal against both.
             ResolveObstacles(obj, r);
             if (!periodicX) resolveAxis(obj.pos.x, obj.vel.x, obj.vel.y, hw, r);
             resolveAxis(obj.pos.y, obj.vel.y, obj.vel.x, hh, r);
@@ -2624,16 +2475,13 @@ static bool Integrate(float subDt) {
     return true;
 }
 
-// Draws the current particles/boundary and submits the frame (capturing it if a video recording
-// is active), then records the per-frame bookkeeping (kinetic-energy history, CSV data sample) —
-// one call is exactly one simulated+rendered(+captured) frame, at whatever dt physics was just
-// advanced by. Running calls this once per real frame; AdvanceRendering calls it back-to-back at
-// a fixed 1/fps dt instead, with no pacing to real time and no ImGui overlay drawn over it (an
-// overlay would get baked straight into the captured video — see VulkanContext::RenderFrame).
+// Draws the current particles/boundary, submits the frame (capturing it if recording), then
+// records the CSV data sample. One call is one simulated+rendered frame at whatever dt physics
+// just advanced by. Running calls it once per real frame; AdvanceRendering calls it back-to-back
+// at a fixed 1/fps dt.
 static void DrawAndSubmitFrame(float dt, bool offscreen) {
-    // Particles are read under simMutex (the worker thread owns them while stepping). If the worker
-    // is wedged in one substep the frame is still presented, just without particles, so the UI can
-    // say so — the lock is dropped again before RenderFrame, which blocks on vsync/the GPU.
+    // Particles are read under simMutex. If the worker is wedged the frame is still presented,
+    // without particles, so the UI can say so. The lock is dropped before RenderFrame blocks.
     SimLock lk;
     if (!LockSim(lk, offscreen ? 5000 : 100)) {
         app.RenderFrame(dt);
@@ -2641,11 +2489,9 @@ static void DrawAndSubmitFrame(float dt, bool offscreen) {
     }
 
     const bool coloring = colorMode != ColorMode::Off && !objects.empty();
-    float kineticEnergy = 0.f;
     float colorLo = 0.f, colorHi = 0.f;
     if (coloring) colorLo = colorHi = FieldValue(objects[0], colorMode);
     for (auto& obj : objects) {
-        kineticEnergy += 0.5f * (obj.vel.x * obj.vel.x + obj.vel.y * obj.vel.y);
         if (coloring) {
             const float v = FieldValue(obj, colorMode);
             colorLo = std::min(colorLo, v);
@@ -2653,14 +2499,11 @@ static void DrawAndSubmitFrame(float dt, bool offscreen) {
         }
     }
 
-    // Display-only x shift (see Integrate's cameraOffsetX accumulation) — never touches obj.pos,
-    // so physics/CSV/data-save all still see true simulated positions.
+    // Display-only x shift (see Integrate's cameraOffsetX); never touches obj.pos.
     const bool  followCam = ActiveScene.boundary.periodicX && cameraFollow;
     const float hw        = ScreenHalfWidth();
     if (coloring) {
-        // Auto-scaled to the current frame's range rather than a fixed scale — the field's
-        // magnitude varies wildly across scenes (and over a Poiseuille run's own ramp-up), so a
-        // fixed range would either clip everything to one end or wash out early on.
+        // Auto-scaled to the current frame's range, since field magnitudes vary wildly across scenes and over a run.
         const ColorRamp& ramp = colorRamps[static_cast<int>(colorMode)];
         const float range = colorHi - colorLo;
         for (auto& obj : objects) {
@@ -2686,24 +2529,18 @@ static void DrawAndSubmitFrame(float dt, bool offscreen) {
     DrawBoundary(app);
     DrawObstacles(app, followCam, hw);
 
-    // Batch rendering (see AdvanceRendering) never touches the swapchain/window at all — offscreen
-    // draws+captures every frame unconditionally instead, so it can't be throttled by vsync or by
-    // the OS deprioritizing an occluded/backgrounded window.
-    // RenderFrame draws the ImGui callback, which takes simMutex itself, and blocks on vsync/the
-    // GPU — release it so the worker keeps simulating meanwhile.
+    // Batch rendering draws and captures offscreen every frame, with no swapchain, so vsync can't
+    // throttle it. RenderFrame draws the ImGui callback (which takes simMutex itself) and blocks on
+    // vsync/the GPU, so release the lock meanwhile.
     lk.unlock();
     if (offscreen) app.RenderOffscreenFrame();
     else           app.RenderFrame(dt);
     if (!LockSim(lk, offscreen ? 5000 : 100)) return;
 
-    if (runIndex != lastRunIndexForKE) { lastRunIndexForKE = runIndex; runFrameForKE = 0; }
-    keByFrame.push_back({ runIndex, runFrameForKE++, kineticEnergy });
-
     if (dataRecorder.IsActive()) {
         dataAccum += dt;
         const float interval = 1.f / static_cast<float>(dataRateActive);
-        // Sampled on its own accumulator, independent of the render/physics rate, same as
-        // Recorder's fps gate for video — dataRate is usually far below the sim's own rate.
+        // Sampled on its own accumulator, independent of the render/physics rate.
         if (dataAccum >= interval) {
             dataAccum -= interval;
 
@@ -2722,19 +2559,13 @@ static void DrawAndSubmitFrame(float dt, bool offscreen) {
     }
 }
 
-// Crunches physics AND rendering/capture back-to-back at a fixed 1/fps dt instead of pacing to
-// real time, so a video finishes as fast as the CPU/GPU can produce it rather than taking
-// lengthSeconds of real time. Draws+captures offscreen (see DrawAndSubmitFrame/
-// RenderOffscreenFrame) — no swapchain/window involvement, so nothing here can be throttled by
-// vsync or by the OS deprioritizing an occluded/backgrounded window. Relies on the recorder's own
-// length cap to know when it's done — once app.IsRecording() goes false (length reached, or
-// Cancel's StopRecording()), there's no live playback to fall into, so this goes straight back to
-// Menu. Still budgeted to a wall-clock slice per call so the main loop's PollEvents() keeps the
-// window responsive during a long render instead of hanging; the caller separately refreshes the
-// on-screen progress overlay once per real tick (a plain, cheap swapchain present, decoupled from
-// this loop's own pace) rather than this loop touching the swapchain itself.
-// True while the active run still has an output driving the batch loop — a data-only queue entry
-// (no video) never sets app.IsRecording(), so the loop needs both checked to know it's still going.
+// Runs physics and rendering/capture back-to-back at a fixed 1/fps dt instead of real-time pacing,
+// drawing and capturing offscreen (see DrawAndSubmitFrame/RenderOffscreenFrame). Relies on the
+// recorder's length cap to know when it's done; once app.IsRecording() goes false there is no
+// playback, so it returns to Menu. Budgeted to a wall-clock slice per call so PollEvents() keeps
+// the window responsive; the caller refreshes the progress overlay once per real tick.
+// True while the active run still has an output driving the batch loop. A data-only entry never
+// sets app.IsRecording(), so both are checked.
 static bool BatchRunActive() { return app.IsRecording() || dataRecorder.IsActive() || profileLogger.IsActive(); }
 
 static void AdvanceRendering() {
@@ -2751,17 +2582,15 @@ static void AdvanceRendering() {
             break;
     }
 
-    // A diverged batch run can't make progress: finish its outputs (what was captured so far is
-    // kept) and fall through to the normal "run finished" handling, which moves on to the next
-    // queued entry or back to the menu. The fault itself stays flagged for the top bar.
+    // A diverged batch run can't progress: finish its outputs (keeping what was captured) and fall
+    // through to the normal "run finished" handling. The fault stays flagged for the top bar.
     if (simFaulted) {
         app.StopRecording();
         dataRecorder.Stop();
         profileLogger.Stop();
     }
 
-    // StopRecording()/dataRecorder.Stop() here are no-ops if the output already stopped itself on
-    // reaching its own length cap — this just handles whichever one (or both) just finished.
+    // These stops are no-ops if an output already stopped itself at its length cap.
     if (!BatchRunActive()) {
         if (queueRunningIndex >= 0) AdvanceQueue();
         else                        ReturnToMenu();
@@ -2769,10 +2598,8 @@ static void AdvanceRendering() {
 }
 
 int main(int, char**) {
-    // Assigned here, not via a default member initializer on MenuConfig — menuConfig (this TU)
-    // and ScenePresets (Scene.cpp) are globals in different translation units with unspecified
-    // relative init order, so reading ScenePresets[0] from a static initializer would be a real
-    // hazard. By main()'s first line every global constructor has already run.
+    // Assigned here, not via a default member initializer: menuConfig and ScenePresets are globals
+    // in different translation units with unspecified init order.
     menuConfig.scene = ScenePresets[0];
     RefreshUserPresets();
 
@@ -2784,7 +2611,6 @@ int main(int, char**) {
     });
 
     objects.reserve(100000);
-    keByFrame.reserve(1u << 16); // avoid mid-run reallocations from skewing frame timing
     StartSimThread();
 
     using Clock = std::chrono::steady_clock;
@@ -2792,8 +2618,7 @@ int main(int, char**) {
 
     profiler.MarkFrameStart();
     while (app.PollEvents()) {
-        // Drained every frame regardless of appState so a press queued during the menu (or while
-        // a text field had focus) never leaks into the next Running session.
+        // Drained every frame regardless of appState so a stale press can't leak into the next run.
         const bool stepPressed    = app.TakeStepForward();
         const bool bigStepPressed = app.TakeStepForwardBig();
         const bool spacePressed   = app.TakeSpaceToggle();
@@ -2806,21 +2631,19 @@ int main(int, char**) {
             if (spacePressed)   TogglePause();
             if (stepPressed)    StepOnce();
             if (bigStepPressed) StepBig();
-            // The worker thread does the stepping; this just tells it how much time has passed.
+            // The worker does the stepping; this tells it how much time has passed.
             if (!paused && !simFaulted) QueueSimTime(dt);
             profiler.MarkComputeEnd();
             lockWaitMs = 0.f;
             const auto drawStart = Clock::now();
             DrawAndSubmitFrame(dt, /*offscreen=*/false);
             profiler.MarkRenderEnd();
-            // The frame's real CPU render work: everything in DrawAndSubmitFrame minus the time
-            // blocked on the GPU/vsync (RenderFrame) and on the sim thread's lock.
+            // The frame's CPU render work: DrawAndSubmitFrame minus GPU/vsync and sim-lock waits.
             const float drawMs = std::chrono::duration<float, std::milli>(Clock::now() - drawStart).count();
             const float workMs = std::max(drawMs - app.LastBlockedMs() - lockWaitMs, 0.f);
             renderCpuMs = renderCpuMs * 0.9f + workMs * 0.1f;
         } else if (appState == AppState::Rendering) {
-            // Same key Running uses for pause/resume; the Cancel button in DrawRenderingOverlay
-            // does the same thing.
+            // Same key Running uses for pause/resume; equivalent to the Cancel button.
             if (spacePressed) {
                 ReturnToMenu();
             } else {
@@ -2828,10 +2651,8 @@ int main(int, char**) {
                 AdvanceRendering();
                 profiler.MarkRenderEnd();
             }
-            // Refreshes the progress overlay (or, if AdvanceRendering just finished, the menu) —
-            // deliberately separate from AdvanceRendering's own offscreen capture loop above, so
-            // showing it only costs one swapchain acquire/present per real tick, not one per video
-            // frame captured within that tick's budget.
+            // Refreshes the progress overlay (or the menu if AdvanceRendering just finished): one
+            // swapchain present per real tick, separate from the offscreen capture loop above.
             app.RenderFrame(dt);
         } else {
             AddMenuPreviewParticles(); // Menu: a physics-free preview of the scene's particles
@@ -2849,10 +2670,8 @@ int main(int, char**) {
 
         profiler.MarkFrameStart();
     }
-    // The worker may be stuck inside a substep (a hung sim is exactly what it exists to survive):
-    // then it can't be joined, and static destructors must not run underneath it.
+    // The worker may be stuck in a substep and unjoinable; static destructors must not run under it.
     const bool workerStopped = StopSimThread();
-    WriteKineticEnergyCsv(keByFrame);
     app.Shutdown();
     if (!workerStopped) std::_Exit(0);
     return 0;

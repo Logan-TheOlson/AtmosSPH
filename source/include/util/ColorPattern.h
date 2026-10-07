@@ -5,8 +5,7 @@
 struct ColorImage;
 
 // Evaluates a SceneColorPattern at world positions inside a rectangle (the spawn block's bounds).
-// Image patterns are loaded through a one-entry cache keyed by path, so building a sampler every
-// frame (the setup preview) doesn't re-read the file.
+// Images go through a one-entry cache keyed by path, so per-frame samplers don't re-read the file.
 class PatternSampler {
 public:
     // blendStrength > 0 softens the hard A/B transitions of stripes, checker and rings into gradients,

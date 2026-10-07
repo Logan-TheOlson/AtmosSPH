@@ -3,10 +3,9 @@
 #include <string>
 #include <vector>
 
-// Builds formatted, collision-safe base filenames shared between a run's video and CSV output, so
-// e.g. "SG_run003_150x150_g20_k1200.mp4" and "...csv" both trace back to the same run at a
-// glance. Takes plain scalars (not a Scene) so it has no dependency on engine/Scene.h and is
-// callable from both App::StartRecording's path and DataRecorder::Start's path.
+// Builds collision-safe base filenames shared by a run's video and CSV output, so e.g.
+// "SG_run003_22500p_g20_k1200.mp4" and "...csv" trace back to the same run. Takes plain scalars
+// rather than a Scene to avoid depending on engine/Scene.h.
 namespace RunNaming {
 
 struct RunNameParams {
@@ -18,18 +17,15 @@ struct RunNameParams {
     int         runNumber      = 0;
 };
 
-// Fixed 2-letter codes for the 3 compiled presets; any other name (a loaded custom preset) falls
-// back to initials of its whitespace-separated words (capped at 4 letters), or "CU" if the name
-// has no letters to take initials from.
+// Fixed 2-letter codes for the built-in presets; any other name falls back to the initials of its
+// words (capped at 4 letters), or "CU" if it has no letters.
 std::string AbbreviateSceneName(const std::string& sceneName);
 
 // e.g. "SG_run003_22500p_g20_k1200" for Self-Gravity, 22500 particles, g=20, stiffness=1200.
 std::string BuildBaseName(const RunNameParams& params);
 
-// Monotonic per-process counter starting at 1 — shared by a run's video and CSV output (call once
-// per run, not once per output) so sequential runs in one process session never collide on the
-// number alone. Resets across a process restart; EnsureUniqueBaseName is the cross-restart
-// safety net.
+// Per-process counter starting at 1. Call once per run, not once per output. Resets on restart;
+// EnsureUniqueBaseName covers collisions across restarts.
 int NextRunNumber();
 
 struct OutputTarget {
@@ -37,9 +33,8 @@ struct OutputTarget {
     std::string           extension; // includes the leading dot, e.g. ".mp4"
 };
 
-// If <target.dir>/<baseName><target.extension> doesn't already exist for any target, returns
-// baseName unchanged; otherwise appends _2, _3, ... and rechecks every target together, so a
-// video/CSV pair sharing one baseName stays paired even if only one of the two collided.
+// Returns baseName if no target file already exists; otherwise appends _2, _3, ... and rechecks
+// every target together, so a video/CSV pair stays paired.
 std::string EnsureUniqueBaseName(const std::string& baseName, const std::vector<OutputTarget>& targets);
 
 } // namespace RunNaming

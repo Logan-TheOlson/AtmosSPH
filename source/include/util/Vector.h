@@ -1,7 +1,3 @@
-//
-// Created by Logan on 7/21/2026.
-//
-
 #ifndef STJARNA_VECTOR_H
 #define STJARNA_VECTOR_H
 

@@ -4,10 +4,8 @@
 #include <string>
 #include <vector>
 
-// User-saved scene presets, stored as flat "key=value" text files next to the executable (no
-// JSON/INI library anywhere in this codebase, and none added here). Distinct from the 3 compiled
-// ScenePresets (Scene.h) — these are written by Engine.cpp's "Save Current as Preset" button and
-// read back into the menu's scene list at startup and after each save.
+// User-saved scene presets, stored as flat "key=value" text files next to the executable.
+// Distinct from the built-in ScenePresets (Scene.h).
 struct ScenePresetEntry {
     std::string           name;
     std::string           description;
@@ -18,18 +16,11 @@ struct ScenePresetEntry {
 // false only if the file can't be opened for writing.
 bool SaveScenePreset(const std::filesystem::path& path, const Scene& scene);
 
-// Reads a file written by SaveScenePreset back into `out`. A key not present in the file leaves
-// `out`'s corresponding field untouched (forward-compatible with fields added to Scene later); an
-// unrecognized key is skipped with a stderr warning. Returns false only if the file can't be
-// opened at all.
+// Reads a file written by SaveScenePreset into `out`. Keys missing from the file leave `out`'s
+// fields untouched; unrecognized keys are skipped with a stderr warning. Returns false only if the
+// file can't be opened.
 bool LoadScenePreset(const std::filesystem::path& path, Scene& out);
 
-// Scans `presetsDir` for *.scenepreset files, skipping (with a stderr warning) any that can't be
-// loaded, sorted by name. Does not include the 3 compiled ScenePresets.
+// Scans `presetsDir` for *.scenepreset files sorted by name, skipping (with a stderr warning) any
+// that can't be loaded. Does not include the built-in ScenePresets.
 std::vector<ScenePresetEntry> ScanUserPresets(const std::filesystem::path& presetsDir);
-
-// Loads entry.path and overrides its spawn grid to gridCountX x gridCountY (clamped to >= 1). No
-// recalibration is attempted the way BuildScene() re-derives a compiled preset's physics
-// constants for its own grid count — there's no generic formula for an arbitrary custom preset,
-// so resizing one only changes how many particles spawn, not how they're tuned.
-Scene BuildSceneFromPreset(const ScenePresetEntry& entry, int gridCountX, int gridCountY);

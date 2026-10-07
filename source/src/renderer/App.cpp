@@ -14,7 +14,7 @@ bool App::PollEvents()       { return window.PollEvents(); }
 void App::RenderFrame(float dt) { vk.RenderFrame(dt); }
 
 bool App::StartRecording(const std::string& title, int fps, float lengthSeconds) {
-    // No fallback name of its own: the caller passes the generated run name (the one default).
+    // No fallback name: the caller passes the generated run name.
     const std::string safeTitle = SanitizeFilename(title, "");
     if (safeTitle.empty()) {
         std::cerr << "StartRecording: empty file name\n";

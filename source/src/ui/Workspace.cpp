@@ -37,13 +37,12 @@ void Workspace::EndTopBar() {
 
 Workspace::Frame Workspace::DockSpace() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    // Passthru: the central node draws nothing, so the sim (rendered underneath ImGui) shows
-    // through it, and clicks there reach the sim instead of a window.
+    // Passthru: the central node draws nothing, so the sim shows through and clicks reach it.
     const ImGuiID id = ImGui::DockSpaceOverViewport(0, vp, ImGuiDockNodeFlags_PassthruCentralNode);
 
     const ImGuiDockNode* node = ImGui::DockBuilderGetNode(id);
     if (layoutResetRequested || node == nullptr || node->IsLeafNode()) {
-        // No saved layout (first run / ini deleted) or only the bare root: build the default.
+        // No saved layout (or only the bare root): build the default.
         BuildDefaultLayout(id, vp->WorkSize);
         layoutResetRequested = false;
     }

@@ -134,3 +134,21 @@ set_target_properties(${NAME} PROPERTIES DEBUGGER_WORKING_DIRECTORY ${CMAKE_CURR
 target_compile_features(${NAME} PRIVATE cxx_std_20)
 target_link_libraries(${NAME} PRIVATE ${SDL_LIBRARY} imgui_lib volk)
 add_dependencies(${NAME} Shaders Fonts)
+
+if (MINGW)
+    target_link_options(${NAME} PRIVATE -static-libgcc -static-libstdc++ -mwindows)
+
+    # winpthread has to stay a DLL on this toolchain; copy it next to the exe
+    get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    add_custom_command(TARGET ${NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MINGW_BIN_DIR}/libwinpthread-1.dll" "$<TARGET_FILE_DIR:${NAME}>"
+            VERBATIM
+    )
+endif ()
+
+add_custom_command(TARGET ${NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${SDL3_ROOT}/bin/SDL3.dll" "$<TARGET_FILE_DIR:${NAME}>"
+        VERBATIM
+)

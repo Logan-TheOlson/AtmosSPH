@@ -62,9 +62,7 @@ bool VulkanContext::Init(SDL_Window* window) {
     chk(vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data()));
     physicalDevice = devices[0];
 
-    // See VulkanContext.h's sceneSampleCount comment — 4x is plenty to break up the dense-point
-    // moiré it exists for without the memory/bandwidth cost of going higher; every desktop GPU this
-    // app targets supports it, but fall back to no MSAA rather than fail outright if one doesn't.
+    // See sceneSampleCount in VulkanContext.h. 4x is enough; fall back to no MSAA if unsupported.
     {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(physicalDevice, &props);
@@ -100,12 +98,8 @@ bool VulkanContext::Init(SDL_Window* window) {
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, formats.data());
-    // Prefer a UNORM swapchain format, not an _SRGB one: this app writes final display colors
-    // (clear color, ImGui theme, particle colors) directly as the intended 0..1 values, with no
-    // linear-space lighting anywhere that would want gamma-correct blending. An _SRGB image format
-    // makes the hardware treat every write as linear and re-encode it to sRGB on store, which
-    // brightens/washes out every color (e.g. clear color 0.17,0.20,0.27 (#2b3444) was rendering as
-    // a washed-out slate blue ~0.44,0.49,0.58) — UNORM stores exactly what's written.
+    // Prefer UNORM over _SRGB: colors are written as final display values, and an _SRGB format
+    // would re-encode every write and wash out all colors. Don't revert this.
     imageFormat = formats[0].format; colorSpace = formats[0].colorSpace;
     for (auto& f : formats)
         if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLORSPACE_SRGB_NONLINEAR_KHR)
@@ -129,7 +123,7 @@ bool VulkanContext::Init(SDL_Window* window) {
     CreateShapePipeline("circle.vert.spv", "circle.frag.spv", shapeDescSetLayout, circlePipelineLayout, circlePipeline);
     CreateShapePipeline("rect.vert.spv", "rect.frag.spv", shapeDescSetLayout, rectPipelineLayout, rectPipeline);
 
-    // SSBOs â€” persistently mapped, host-visible + coherent
+    // SSBOs: persistently mapped, host-visible + coherent
     const VkDeviceSize circleSSBOSize = kMaxObjects * sizeof(CircleData);
     CreateSSBO(circleSSBOSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                circleSSBO, circleSSBOMemory, circleMapped);
@@ -137,8 +131,7 @@ bool VulkanContext::Init(SDL_Window* window) {
     CreateSSBO(rectSSBOSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                rectSSBO, rectSSBOMemory, rectMapped);
 
-    // Descriptor pool + sets — one storage-buffer descriptor set each for circles and rects,
-    // sharing shapeDescSetLayout since both are just "one SSBO at binding 0".
+    // Descriptor pool + sets: one storage-buffer set each for circles and rects, sharing shapeDescSetLayout.
     VkDescriptorPoolSize poolSize{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
     VkDescriptorPoolCreateInfo poolCI{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -177,9 +170,8 @@ bool VulkanContext::Init(SDL_Window* window) {
     return true;
 }
 
-// Flat, softly-rounded dark theme built from ui/Theme.h's palette (slate surfaces, periwinkle
-// accent). The UI panels are a lighter shade than the sim canvas (Theme::Canvas, also the scene
-// pass's clear color) so they read as surfaces sitting on top of it.
+// Flat, softly-rounded dark theme built from ui/Theme.h's palette. Panels are lighter than the sim
+// canvas (Theme::Canvas, also the scene pass's clear color).
 static void ApplyModernStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
 
@@ -203,7 +195,7 @@ static void ApplyModernStyle() {
     style.GrabMinSize       = 10.f;
     style.SeparatorTextBorderSize = 1.f;
     style.DockingSeparatorSize    = 3.f;
-    style.ScaleAllSizes(1.2f); // a tad bigger overall — bigger windows, padding, controls, grips
+    style.ScaleAllSizes(1.2f);
 
     using namespace Theme;
     const ImVec4 headerBase = WithAlpha(Accent, 0.28f);
@@ -268,11 +260,8 @@ void VulkanContext::InitImGui(SDL_Window* window) {
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     ApplyModernStyle();
 
-    // Default ImGui font is a small bitmap font (ProggyClean) — crisp at its one fixed size but
-    // blocky otherwise, which is most of what reads as "digital"/debug-overlay rather than app UI.
-    // Karla's soft, rounded terminals are the closest bundled match to a Pinterest-style rounded
-    // sans; it's fetched alongside imgui itself (misc/fonts) and copied next to the exe by
-    // CMakeLists' Fonts target, so it's always present without a separate asset download.
+    // Karla, fetched with imgui (misc/fonts) and copied next to the exe by CMake's Fonts target,
+    // replaces ImGui's default bitmap font.
     ImGuiIO& io = ImGui::GetIO();
     const char* baseDir = SDL_GetBasePath();
     std::string fontPath = std::string(baseDir ? baseDir : "") + "fonts/Karla-Regular.ttf";
@@ -343,8 +332,7 @@ void VulkanContext::CreateSwapchain() {
         chk(vkCreateImageView(device, &ivCI, nullptr, &imageViews[i]));
     }
 
-    // Sized to swapchainExtent, so it must be rebuilt every time that changes too — the caller
-    // (Init()/RecreateSwapchain()) has already made sure the GPU is idle before we get here.
+    // Sized to swapchainExtent, so rebuilt whenever that changes; the caller has already idled the GPU.
     DestroyColorImage(swapchainMsaaImage, swapchainMsaaMemory, swapchainMsaaView);
     if (sceneSampleCount != VK_SAMPLE_COUNT_1_BIT)
         CreateColorImage(swapchainExtent, sceneSampleCount, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
@@ -352,20 +340,16 @@ void VulkanContext::CreateSwapchain() {
 }
 
 void VulkanContext::RecreateSwapchain() {
-    // The capture buffer is sized to the extent at StartRecording() time; a resize would make it
-    // mismatch the new swapchain images, so end a live (captureFromSwapchain_) recording cleanly
-    // rather than corrupt it. A batch render's offscreen target is a fixed size independent of the
-    // swapchain (see RenderOffscreenFrame), so it must survive a resize/minimize of the window
-    // instead of being silently cut short here.
+    // The capture buffer is sized at StartRecording() time, so a resize ends a live
+    // (captureFromSwapchain_) recording rather than corrupting it. A batch render's offscreen
+    // target is independent of the swapchain and survives resizes.
     if (recorder_.IsActive() && captureFromSwapchain_) StopRecording();
     vkDeviceWaitIdle(device);
     CreateSwapchain();
 }
 
-// Shared by RenderFrame() and RenderOffscreenFrame(): draws the current circles/rects into
-// `drawView` at `extent` (resolving into `resolveView` if it's not VK_NULL_HANDLE — see the header
-// comment) and clears both vectors. Must run between vkCmdBeginCommandBuffer and the caller's own
-// barriers/vkCmdEndCommandBuffer.
+// Shared by RenderFrame() and RenderOffscreenFrame(); see the header comment. Must run between
+// vkCmdBeginCommandBuffer and the caller's own barriers/vkCmdEndCommandBuffer.
 void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent,
                                     const SceneViewport* vp) {
     const bool msaa = resolveView != VK_NULL_HANDLE;
@@ -376,8 +360,7 @@ void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveVie
         .resolveImageView = resolveView,
         .resolveImageLayout = msaa ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        // The MSAA attachment itself is transient — only the resolved output (resolveView) is ever
-        // read again — so DONT_CARE saves the driver from actually writing it back to memory.
+        // Only the resolved output is read again, so the MSAA attachment is DONT_CARE.
         .storeOp = msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
         .clearValue = { .color = { .float32 = { Theme::Canvas.x, Theme::Canvas.y, Theme::Canvas.z, 1.0f } } }, // Theme::Canvas
     };
@@ -388,8 +371,8 @@ void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveVie
     };
     vkCmdBeginRendering(cb, &ri);
     {
-        // A sub-rect viewport (the docked UI's free center area) re-centers the world origin in it
-        // and, since invScreen below is derived from the same size, keeps 1 world unit = 1 pixel.
+        // A sub-rect viewport (the free center area) re-centers the world origin and, since
+        // invScreen derives from the same size, keeps 1 world unit = 1 pixel.
         VkViewport viewport{ 0, 0, (float)extent.width, (float)extent.height, 0.0f, 1.0f };
         VkRect2D   scissor{ {0,0}, extent };
         float vw = (float)extent.width, vh = (float)extent.height;
@@ -513,10 +496,7 @@ void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{ .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
     VkPipelineViewportStateCreateInfo      viewportState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rasterizer   { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
-    // Must match whatever sample count the scene pass is actually rendering at (see
-    // VulkanContext.h's sceneSampleCount comment) — dynamic rendering has no render-pass object to
-    // cross-check this against, so a mismatch here wouldn't fail to compile or even necessarily
-    // validate cleanly, just render wrong.
+    // Must match the scene pass's sample count (sceneSampleCount); dynamic rendering won't cross-check it.
     VkPipelineMultisampleStateCreateInfo   multisample  { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = sceneSampleCount };
     VkPipelineColorBlendAttachmentState blendAtt{
         .blendEnable = VK_TRUE,
@@ -571,8 +551,7 @@ void VulkanContext::CreateSSBO(VkDeviceSize size, VkBufferUsageFlags usage, VkMe
     uint32_t memTypeIndex = UINT32_MAX;
     bool coherent = false;
 
-    // Preferred pass first (e.g. HOST_CACHED for a readback buffer), then fall back to plain
-    // HOST_VISIBLE|HOST_COHERENT, which every Vulkan implementation is required to expose.
+    // Preferred flags first, then plain HOST_VISIBLE|HOST_COHERENT, which every implementation exposes.
     for (VkMemoryPropertyFlags want : { required | preferred, required | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT }) {
         for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
             if ((memReq.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & want) == want) {
@@ -661,10 +640,8 @@ void VulkanContext::FlushPendingCapture() {
 void VulkanContext::StopRecording() {
     if (!recorder_.IsActive() && captureBuffers_[0] == VK_NULL_HANDLE) return;
 
-    // Any in-flight GPU copy into a slot finishes here, so it's safe to flush whatever the most
-    // recent frame captured (otherwise every stop — timed or manual — would silently drop it).
-    // Recorder::Stop() then drains its queue (reading directly out of whichever slots are still
-    // pending) before we free them below.
+    // Any in-flight GPU copy finishes here, so the most recent captured frame can be flushed
+    // rather than dropped. Recorder::Stop() then drains its queue before the slots are freed.
     vkDeviceWaitIdle(device);
     FlushPendingCapture();
     recorder_.Stop();
@@ -690,8 +667,7 @@ void VulkanContext::RenderFrame(float dt) {
 
     ImGui::Render();
 
-    // Time spent blocked on the GPU / vsync (fence wait, image acquire, present), reported via
-    // LastBlockedMs() so the UI can separate real CPU render work from waiting.
+    // Time blocked on the GPU/vsync (fence wait, acquire, present), reported via LastBlockedMs().
     using BlockClock = std::chrono::steady_clock;
     blockedMs_ = 0.f;
     auto addBlocked = [this](BlockClock::time_point since) {
@@ -702,9 +678,8 @@ void VulkanContext::RenderFrame(float dt) {
     chk(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
     addBlocked(fenceWaitStart);
 
-    // The wait above proves the previous submission (and any copy it made into a capture slot)
-    // has finished on the GPU, so that slot's data is now valid — hand it to Recorder's
-    // background thread, which does the (possibly slow) read and frees the slot when done.
+    // The wait above proves the previous submission's capture copy has finished, so hand that
+    // slot to Recorder's background thread.
     FlushPendingCapture();
 
     uint32_t imageIndex = 0;
@@ -714,21 +689,16 @@ void VulkanContext::RenderFrame(float dt) {
     if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) { RecreateSwapchain(); circles.clear(); rects.clear(); return; }
     if (acq != VK_SUCCESS) chk(acq);
 
-    // Paces captured frames against `dt` rather than the render loop's actual call rate, so the
-    // output video's duration matches `dt`'s accumulated total regardless of the app's fps. Only
-    // applies while captureFromSwapchain_ is set (the live-recording path, driven from Running) —
-    // during batch rendering, RenderOffscreenFrame does the actual per-video-frame capture and
-    // this function is only called once per real tick to refresh the progress overlay, so it must
-    // not also capture: circles/rects are already cleared by then, so a capture here would splice
-    // a blank frame into the video (see SetCaptureFromSwapchain).
+    // Paces captured frames against `dt` rather than the call rate, so the video's duration matches
+    // accumulated `dt`. Only applies while captureFromSwapchain_ is set; during batch rendering this
+    // is called only to refresh the overlay and capturing would splice in a blank frame.
     bool capturingThisFrame = false;
     bool stopRecordingAfterSubmit = false;
     int  captureSlot = -1;
     if (recorder_.IsActive() && captureFromSwapchain_) {
         const float interval = 1.f / static_cast<float>(recordFps_);
         recordAccum_ += dt;
-        // If the background reader hasn't finished with the next slot yet, skip capturing this
-        // frame rather than stalling for it — dropping a recorded frame beats slowing the sim.
+        // If the reader hasn't freed the next slot, skip this frame rather than stall.
         if (recordAccum_ >= interval && !captureSlotBusy_[captureWriteIndex_].load()) {
             recordAccum_ -= interval;
             captureSlot = captureWriteIndex_;
@@ -755,9 +725,7 @@ void VulkanContext::RenderFrame(float dt) {
     };
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRender);
 
-    // The MSAA target's contents never need to survive between frames (see RecordScenePass), so
-    // there's nothing to preserve across this transition — always coming from UNDEFINED is simplest
-    // and correct whether this is the image's first use or its hundredth.
+    // The MSAA target's contents never survive between frames, so always transition from UNDEFINED.
     if (sceneSampleCount != VK_SAMPLE_COUNT_1_BIT) {
         VkImageMemoryBarrier msaaToRender{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -768,12 +736,9 @@ void VulkanContext::RenderFrame(float dt) {
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &msaaToRender);
     }
 
-    // Pass 1: the simulated scene only (circles/rects). Ends and gets captured (if capturing)
-    // BEFORE ImGui ever draws, so a live-only overlay (the batch-render progress print used to be
-    // a progress bar here, and the profiler HUD below) can never contaminate the recorded video —
-    // see Engine.cpp's AdvanceRendering, which relies on exactly this. Resolves straight from
-    // swapchainMsaaImage into imageViews[imageIndex] (see RecordScenePass) when MSAA is active, so
-    // everything downstream of this call keeps reading imageViews[imageIndex] exactly as before.
+    // Pass 1: the simulated scene only. It ends and is captured before ImGui draws, so UI overlays
+    // never reach the recorded video. With MSAA it resolves from swapchainMsaaImage into
+    // imageViews[imageIndex].
     RecordScenePass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? swapchainMsaaView : imageViews[imageIndex],
                     sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? imageViews[imageIndex] : VK_NULL_HANDLE,
                     swapchainExtent, UsesSceneViewport() ? &sceneViewport_ : nullptr);
@@ -794,8 +759,7 @@ void VulkanContext::RenderFrame(float dt) {
         };
         vkCmdCopyImageToBuffer(cb, images[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffers_[captureSlot], 1, &region);
 
-        // Back to COLOR_ATTACHMENT_OPTIMAL, not PRESENT_SRC — pass 2 (ImGui) below still needs to
-        // draw into this image before it's actually presented.
+        // Back to COLOR_ATTACHMENT_OPTIMAL, not PRESENT_SRC: pass 2 (ImGui) still draws into it.
         VkImageMemoryBarrier backToColor{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -807,8 +771,7 @@ void VulkanContext::RenderFrame(float dt) {
         pendingCaptureSlot_ = captureSlot;
     }
 
-    // Pass 2: ImGui on top — shown live (including over a batch render, see AdvanceRendering),
-    // but drawn after pass 1 was already captured above, so it never reaches the recorded frame.
+    // Pass 2: ImGui on top, drawn after pass 1 was captured so it never reaches the video.
     VkRenderingAttachmentInfo uiAtt{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = imageViews[imageIndex], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -847,9 +810,7 @@ void VulkanContext::RenderFrame(float dt) {
     if (stopRecordingAfterSubmit) StopRecording();
 }
 
-// See the header comment — renders straight to offscreenImage and captures it, touching neither
-// the swapchain nor ImGui, so a batch render can't be throttled by vsync or by the OS treating an
-// occluded/backgrounded window as lower priority: there's simply nothing on screen to throttle.
+// See the header comment: renders to offscreenImage and captures it, touching neither the swapchain nor ImGui.
 void VulkanContext::RenderOffscreenFrame() {
     if (!recorder_.IsActive()) { circles.clear(); rects.clear(); return; }
 
@@ -858,13 +819,9 @@ void VulkanContext::RenderOffscreenFrame() {
     chk(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
     FlushPendingCapture();
 
-    // Unlike RenderFrame()'s live capture — where dropping a frame is invisible and preferred to
-    // stalling real-time rendering — batch mode must produce exactly one captured frame per call,
-    // since AdvanceRendering advances the sim by a fixed dt every call and relies on that 1:1
-    // mapping to keep the video's duration matching the configured sim length. So if the encoder
-    // is behind, block until it frees a slot rather than silently skipping this frame; the caller
-    // already bounds how long AdvanceRendering runs per real tick, so this just spends more of
-    // that budget waiting instead of capturing, and picks back up next tick.
+    // Unlike live capture, batch mode must produce exactly one frame per call, since
+    // AdvanceRendering steps the sim by a fixed dt per call and the video length depends on that.
+    // So if the encoder is behind, block until it frees a slot rather than skip the frame.
     while (captureSlotBusy_[captureWriteIndex_].load())
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     const int captureSlot = captureWriteIndex_;
@@ -884,8 +841,7 @@ void VulkanContext::RenderOffscreenFrame() {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = offscreenEverRendered ? VK_ACCESS_TRANSFER_READ_BIT : VkAccessFlags(0),
         .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        // Every frame after the first left the image in TRANSFER_SRC_OPTIMAL (its own capture
-        // copy, below); only the very first frame starts from UNDEFINED.
+        // Every frame after the first starts in TRANSFER_SRC_OPTIMAL (left by its capture copy).
         .oldLayout = offscreenEverRendered ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
         .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .image = offscreenImage, .subresourceRange = range,
@@ -894,8 +850,7 @@ void VulkanContext::RenderOffscreenFrame() {
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRender);
     offscreenEverRendered = true;
 
-    // Same "always from UNDEFINED" reasoning as RenderFrame()'s swapchainMsaaImage barrier — this
-    // target is never read back either.
+    // Always from UNDEFINED, as with RenderFrame()'s swapchainMsaaImage barrier.
     if (sceneSampleCount != VK_SAMPLE_COUNT_1_BIT) {
         VkImageMemoryBarrier msaaToRender{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -927,7 +882,7 @@ void VulkanContext::RenderOffscreenFrame() {
 
     chk(vkEndCommandBuffer(cb));
 
-    // No semaphores — nothing external (swapchain acquire/present) to synchronize against.
+    // No semaphores: nothing external to synchronize against.
     VkSubmitInfo si{ .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
     chk(vkQueueSubmit(queue, 1, &si, fence));
 
