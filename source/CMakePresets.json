@@ -7,6 +7,7 @@
       "generator": "MinGW Makefiles",
       "binaryDir": "${sourceDir}/../build",
       "cacheVariables": {
+        "CMAKE_BUILD_TYPE":   "Release",
         "CMAKE_C_COMPILER":   "C:/Program Files/JetBrains/CLion 2026.1.3/bin/mingw/bin/gcc.exe",
         "CMAKE_CXX_COMPILER": "C:/Program Files/JetBrains/CLion 2026.1.3/bin/mingw/bin/g++.exe",
         "CMAKE_MAKE_PROGRAM": "C:/Program Files/JetBrains/CLion 2026.1.3/bin/mingw/bin/mingw32-make.exe"

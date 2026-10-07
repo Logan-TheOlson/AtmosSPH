@@ -31,7 +31,11 @@ bool Recorder::Start(const std::string& outputPath, int width, int height, int f
         << " \"" << outputPath << "\"";
 
 #ifdef _WIN32
+    fprintf(stderr, "[rec-dbg] launching: %s\n", cmd.str().c_str()); // TEMP-DEBUG
+    const auto dbgLaunch = std::chrono::steady_clock::now();
     pipe_ = _popen(cmd.str().c_str(), "wb");
+    fprintf(stderr, "[rec-dbg] _popen returned %p after %.1f ms\n", (void*)pipe_,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dbgLaunch).count()); // TEMP-DEBUG
 #else
     pipe_ = popen(cmd.str().c_str(), "w");
 #endif
@@ -67,7 +71,15 @@ void Recorder::WriterLoop() {
             queue_.pop_front();
         }
         // The slow read of `job.data` happens here, off the caller's thread.
-        fwrite(job.data, 1, job.bytes, pipe_);
+        // TEMP-DEBUG: log the first frames' write size/result/duration.
+        static int dbgFrames = 0;
+        const auto dbgT0 = std::chrono::steady_clock::now();
+        if (dbgFrames < 12) fprintf(stderr, "[rec-dbg] writer: fwrite frame %d (%zu bytes) begin\n", dbgFrames, job.bytes);
+        const size_t dbgWritten = fwrite(job.data, 1, job.bytes, pipe_);
+        if (dbgFrames < 12 || dbgWritten != job.bytes)
+            fprintf(stderr, "[rec-dbg] writer: frame %d wrote %zu/%zu in %.1f ms\n", dbgFrames, dbgWritten, job.bytes,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dbgT0).count());
+        dbgFrames++;
         job.release();
     }
 

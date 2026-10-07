@@ -1,6 +1,6 @@
 #pragma once
 
-// Runtime gravity tuning, mirroring main.cpp's scene-driven SPH constants
+// Runtime gravity tuning, mirroring Sph.cpp's scene-driven SPH constants
 // (RecomputeSphConstants): set once per scene load via Gravity::SetParams(),
 // shared by Gravity.cpp and Quadtree.cpp so each reads live values instead
 // of a compile-time Config constant, without threading five extra

@@ -46,8 +46,13 @@ The window is a docked layout around the simulation view: a left panel, a right 
 
 ```
 source/
-  src/main.cpp                SPH core: spatial grid, density, pressure, viscosity, Init()/Update()
-  src/engine/Engine.cpp       App state machine, sim worker thread, main loop, all UI panels
+  src/main.cpp                Entry point; calls RunEngine()
+  src/physics/Sph.cpp         SPH core: spatial grid, density, pressure, viscosity, Init()/Update()
+  src/engine/Engine.cpp       RunEngine() main loop, physics substep, frame drawing, batch rendering
+  src/engine/EngineSim.cpp    Shared app state, sim worker thread, run/queue control
+  src/engine/EngineUi.cpp     Top bar, setup tabs, live/render panels, DrawUi()
+  src/engine/EnginePanels.cpp Event/color/obstacle/group editors and the sim-view overlay
+  src/engine/ProfileLogger.cpp  Channel velocity-profile CSV logger
   src/engine/Scene.cpp        Built-in presets and scene construction
   src/engine/ScenePresetIO.cpp  Save/load user presets
   src/engine/Object.cpp       Per-particle radius and draw

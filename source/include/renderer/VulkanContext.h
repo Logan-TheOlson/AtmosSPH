@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include <volk.h>
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <string>
@@ -27,36 +28,45 @@ public:
     float HalfWidth()  const { return swapchainExtent.width  * 0.5f; }
     float HalfHeight() const { return swapchainExtent.height * 0.5f; }
 
-    // The half-extents the simulation should measure its boundary against: pinned to the active
-    // recording's fixed resolution while one is in progress, since the swapchain can resize under
-    // a batch render and HalfWidth()/HalfHeight() would then disagree with the recorded frame.
-    float RecordingHalfWidth()  const { return recorder_.IsActive() ? recordWidth_  * 0.5f : UsesSceneViewport() ? sceneViewport_.w * 0.5f : HalfWidth(); }
-    float RecordingHalfHeight() const { return recorder_.IsActive() ? recordHeight_ * 0.5f : UsesSceneViewport() ? sceneViewport_.h * 0.5f : HalfHeight(); }
+    // The simulated area, in pixels: the world the scene is laid out in and the resolution
+    // recordings are captured at, independent of the window. The live view shows it scaled to fit
+    // the view area (SceneZoom()). Set from the scene's boundary resolution.
+    void  SetSimArea(float w, float h) { simW_ = w; simH_ = h; }
 
     // Restricts the live scene pass to this framebuffer-pixel rect (the free area between the docked
-    // panels), with the world origin at its center. w/h = 0 means the full window. Ignored while
-    // recording, since live capture reads the swapchain image from (0,0).
+    // panels), with the world origin at its center. w/h = 0 means the full window. Recordings are
+    // unaffected: they are captured offscreen at the simulated area's resolution.
     struct SceneViewport { float x = 0.f, y = 0.f, w = 0.f, h = 0.f; };
     void SetSceneViewport(float x, float y, float w, float h) { sceneViewport_ = { x, y, w, h }; }
-    bool UsesSceneViewport() const { return sceneViewport_.w > 0.f && sceneViewport_.h > 0.f && !recorder_.IsActive(); }
+    bool UsesSceneViewport() const { return ActiveViewport() != nullptr; }
+    // World-to-screen scale of the live scene pass: the simulated area scaled to fit the view.
+    float SceneZoom() const {
+        const SceneViewport* vp = ActiveViewport();
+        const float vw = vp ? vp->w : static_cast<float>(swapchainExtent.width);
+        const float vh = vp ? vp->h : static_cast<float>(swapchainExtent.height);
+        if (!(simW_ > 0.f) || !(simH_ > 0.f) || !(vw > 0.f) || !(vh > 0.f)) return 1.f;
+        constexpr float Margin = 0.96f; // leaves the container outline some room
+        return Margin * std::min(vw / simW_, vh / simH_);
+    }
     // Center of the rect the live scene is drawn into, in framebuffer pixels: the world origin on screen.
     void SceneCenterPx(float& cx, float& cy) const {
-        if (UsesSceneViewport()) { cx = sceneViewport_.x + sceneViewport_.w * 0.5f; cy = sceneViewport_.y + sceneViewport_.h * 0.5f; }
-        else                     { cx = HalfWidth(); cy = HalfHeight(); }
+        if (const SceneViewport* vp = ActiveViewport()) { cx = vp->x + vp->w * 0.5f; cy = vp->y + vp->h * 0.5f; }
+        else                                            { cx = HalfWidth(); cy = HalfHeight(); }
     }
 
-    // Captures the composited (scene + UI) swapchain image at `fps`, paced against real time (via
-    // RenderFrame's dt). lengthSeconds <= 0 records until StopRecording().
-    bool  StartRecording(const std::string& outputPath, int fps, float lengthSeconds);
+    // Captures the scene (not the UI) at width x height pixels (the simulated area; even, for the
+    // encoder) at `fps`. Live capture is paced against real time (via RenderFrame's dt).
+    // lengthSeconds <= 0 records until StopRecording().
+    bool  StartRecording(const std::string& outputPath, int fps, float lengthSeconds, int width, int height);
     void  StopRecording();
     bool  IsRecording() const { return recorder_.IsActive(); }
     float RecordedSeconds() const { return recordFps_ > 0 ? static_cast<float>(recordedFrames_) / recordFps_ : 0.f; }
 
     // False while batch rendering, so the per-tick RenderFrame() that keeps the progress overlay up
-    // doesn't capture a blank swapchain frame into the video. True otherwise.
+    // doesn't also capture a frame into the video. True otherwise.
     void  SetCaptureFromSwapchain(bool enable) { captureFromSwapchain_ = enable; }
 
-    // Renders the scene (not UI) to an offscreen target and captures it, with no swapchain or
+    // Renders the scene (not UI) to the offscreen target and captures it, with no swapchain or
     // present, so it can't be throttled by vsync. Every call captures one frame and auto-stops at
     // the length cap set by StartRecording(). A no-op if no recording is active.
     void RenderOffscreenFrame();
@@ -156,6 +166,12 @@ private:
     std::vector<RectData>   rects;
 
     SceneViewport   sceneViewport_{};
+    float           simW_{ 0.f }, simH_{ 0.f };
+
+    // The rect the live scene pass draws into, or null for the whole swapchain.
+    const SceneViewport* ActiveViewport() const {
+        return sceneViewport_.w > 0.f && sceneViewport_.h > 0.f ? &sceneViewport_ : nullptr;
+    }
     std::function<void()> uiCallback_;
     float                 blockedMs_{ 0.f };
 
@@ -181,7 +197,7 @@ private:
     std::atomic<bool> captureSlotBusy_[kCaptureSlots]{};
     int               captureWriteIndex_{ 0 };
     int               pendingCaptureSlot_{ -1 }; // slot the most recent submission copied into, not yet handed to Recorder
-    bool              captureFromSwapchain_{ true }; // see SetCaptureFromSwapchain
+    bool              captureFromSwapchain_{ true }; // see SetCaptureFromSwapchain (name kept: it gates RenderFrame()'s capture)
 
     // Hands pendingCaptureSlot_ (if any) to Recorder and clears it. Call only once the GPU copy has
     // finished (after a fence wait or vkDeviceWaitIdle).
@@ -189,14 +205,18 @@ private:
 
     void CreateSwapchain();
     void RecreateSwapchain();
-    // The circle/rect draw pass shared by RenderFrame() and RenderOffscreenFrame(): clears
-    // `drawView`, draws the current circles/rects at `extent`, then clears both vectors. Callers
-    // own the command buffer and barriers (including transitioning to COLOR_ATTACHMENT_OPTIMAL).
+    // The circle/rect draw pass shared by RenderFrame() and the offscreen capture: clears
+    // `drawView` and draws the current circles/rects at `extent`, scaled by `zoom`, then clears
+    // both vectors unless `keepShapes`. Callers own the command buffer and barriers (including
+    // transitioning to COLOR_ATTACHMENT_OPTIMAL).
     //
     // `resolveView` is VK_NULL_HANDLE without MSAA, and `drawView` is then the final target.
     // Otherwise `drawView` is the MSAA target and `resolveView` the single-sample image it resolves into.
     void RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent,
-                         const SceneViewport* viewport = nullptr);
+                         const SceneViewport* viewport = nullptr, float zoom = 1.f, bool keepShapes = false);
+    // Records, into the current command buffer, a full-resolution scene pass into offscreenImage
+    // followed by its copy into captureBuffers_[slot]. Leaves the shapes for a later pass if `keepShapes`.
+    void RecordOffscreenCapture(int slot, bool keepShapes);
     void CreateShapePipeline(const char* vertSpv, const char* fragSpv,
                              VkDescriptorSetLayout descSetLayout,
                              VkPipelineLayout& outLayout, VkPipeline& outPipeline);

@@ -22,16 +22,17 @@ public:
     int   Height()     const;
     float HalfWidth()  const;
     float HalfHeight() const;
-    // See VulkanContext::RecordingHalfWidth/Height.
-    float RecordingHalfWidth()  const { return vk.RecordingHalfWidth(); }
-    float RecordingHalfHeight() const { return vk.RecordingHalfHeight(); }
+    // See VulkanContext::SetSimArea / SceneZoom.
+    void  SetSimArea(float w, float h)   { vk.SetSimArea(w, h); }
+    float SceneZoom()           const { return vk.SceneZoom(); }
     // See VulkanContext::SetSceneViewport / SceneCenterPx (framebuffer pixels).
     void  SetSceneViewport(float x, float y, float w, float h) { vk.SetSceneViewport(x, y, w, h); }
     void  SceneCenterPx(float& cx, float& cy) const { vk.SceneCenterPx(cx, cy); }
 
     // Starts (or restarts) recording the composited frame to <recordingsDir>/<title>.mp4 via
     // ffmpeg. lengthSeconds <= 0 records until StopRecording().
-    bool  StartRecording(const std::string& title, int fps, float lengthSeconds);
+    // width x height is the video's resolution (see VulkanContext::StartRecording).
+    bool  StartRecording(const std::string& title, int fps, float lengthSeconds, int width, int height);
     void  StopRecording()                { vk.StopRecording(); }
     bool  IsRecording()            const { return vk.IsRecording(); }
     float RecordedSeconds()        const { return vk.RecordedSeconds(); }

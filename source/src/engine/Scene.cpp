@@ -1,9 +1,10 @@
 #include "engine/Scene.h"
+#include "engine/SceneHelpers.h"
 #include "physics/Gravity.h"
 #include <algorithm>
 #include <cmath>
 
-// Defined in main.cpp: recomputes the cached SPH kernel constants derived from SceneParticles.
+// Defined in physics/Sph.cpp: recomputes the cached SPH kernel constants derived from SceneParticles.
 void RecomputeSphConstants();
 
 namespace {
@@ -210,6 +211,16 @@ Scene BuildScene(int presetIndex, int gridCountX, int gridCountY) {
     }
 }
 
+void AutoTuneSph(SceneParticles& p) {
+    const SceneParticles ref; // the default-initialized values are the calibration
+    const float q  = std::max(p.circleRadius, 0.5f) / ref.circleRadius;
+    const float q2 = q * q;
+    p.smoothingRadius    = ref.smoothingRadius * q;
+    p.targetDensity      = ref.targetDensity / q2;
+    if (p.eos == EosModel::WCSPH) p.stiffness = ref.stiffness * q2;
+    p.kinematicViscosity = ref.kinematicViscosity * q2;
+}
+
 SceneGroup SpawnBlockAsGroup(Scene& scene, float halfWidth, float halfHeight) {
     auto& spawn = scene.spawn;
     const float spacing = scene.particles.circleRadius * 3.0f * spawn.spacingScale;
@@ -242,6 +253,44 @@ SceneGroup SpawnBlockAsGroup(Scene& scene, float halfWidth, float halfHeight) {
         g.halfH = static_cast<float>(spawn.gridCountY) * spacing * 0.5f;
     }
     return g;
+}
+
+void SetSceneResolution(Scene& s, int width, int height) {
+    constexpr int MinRes = 64, MaxRes = 8192;
+    width  = std::clamp(width,  MinRes, MaxRes) & ~1;
+    height = std::clamp(height, MinRes, MaxRes) & ~1;
+
+    SceneBoundary& b = s.boundary;
+    const float sx = static_cast<float>(width)  / static_cast<float>(std::max(b.resWidth,  1));
+    const float sy = static_cast<float>(height) / static_cast<float>(std::max(b.resHeight, 1));
+    b.resWidth  = width;
+    b.resHeight = height;
+    if (sx == 1.f && sy == 1.f) return;
+
+    const float sr = std::min(sx, sy); // lengths with no axis (radii, cell sizes) shrink with the tighter one
+    auto scaleShape = [&](auto& o) {
+        o.cx *= sx; o.cy *= sy;
+        o.radius *= sr;
+        o.halfW *= sx; o.halfH *= sy;
+    };
+    for (SceneEvent& e : s.events)           scaleShape(e);
+    for (SceneColorRegion& r : s.colorRegions) scaleShape(r);
+    for (SceneObstacle& o : s.obstacles)     scaleShape(o);
+    for (SceneGroup& g : s.groups)           scaleShape(g);
+
+    if (b.halfWidthPx  > 0.f) b.halfWidthPx  *= sx;
+    if (b.halfHeightPx > 0.f) b.halfHeightPx *= sy;
+
+    if (!s.spawn.fillBoundary) {
+        auto scaleCount = [](int count, float scale) {
+            return std::clamp(static_cast<int>(std::lround(static_cast<float>(count) * scale)), 1, MaxSpawnParticles);
+        };
+        s.spawn.gridCountX = scaleCount(s.spawn.gridCountX, sx);
+        s.spawn.gridCountY = scaleCount(s.spawn.gridCountY, sy);
+    }
+
+    s.colorPattern.cellSize *= sr;
+    s.blendRadius           *= sr;
 }
 
 int SceneParticleCount(const Scene& scene) {

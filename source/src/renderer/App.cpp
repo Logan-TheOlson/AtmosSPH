@@ -13,7 +13,7 @@ void App::Init(const char* title, int w, int h) {
 bool App::PollEvents()       { return window.PollEvents(); }
 void App::RenderFrame(float dt) { vk.RenderFrame(dt); }
 
-bool App::StartRecording(const std::string& title, int fps, float lengthSeconds) {
+bool App::StartRecording(const std::string& title, int fps, float lengthSeconds, int width, int height) {
     // No fallback name: the caller passes the generated run name.
     const std::string safeTitle = SanitizeFilename(title, "");
     if (safeTitle.empty()) {
@@ -30,7 +30,7 @@ bool App::StartRecording(const std::string& title, int fps, float lengthSeconds)
         return false;
     }
 
-    return vk.StartRecording((dir / (safeTitle + ".mp4")).string(), fps, lengthSeconds);
+    return vk.StartRecording((dir / (safeTitle + ".mp4")).string(), fps, lengthSeconds, width, height);
 }
 
 void App::AddCircle(float cx, float cy, float radius, Color color) { vk.AddCircle(cx, cy, radius, color); }

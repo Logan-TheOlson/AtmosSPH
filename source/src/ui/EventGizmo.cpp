@@ -1,4 +1,5 @@
 #include "ui/EventGizmo.h"
+#include "engine/SceneHelpers.h"
 #include "ui/Theme.h"
 #include <algorithm>
 #include <cmath>

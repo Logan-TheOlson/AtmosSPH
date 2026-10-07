@@ -340,10 +340,7 @@ void VulkanContext::CreateSwapchain() {
 }
 
 void VulkanContext::RecreateSwapchain() {
-    // The capture buffer is sized at StartRecording() time, so a resize ends a live
-    // (captureFromSwapchain_) recording rather than corrupting it. A batch render's offscreen
-    // target is independent of the swapchain and survives resizes.
-    if (recorder_.IsActive() && captureFromSwapchain_) StopRecording();
+    // Recordings capture an offscreen target sized by the scene, so a window resize doesn't touch them.
     vkDeviceWaitIdle(device);
     CreateSwapchain();
 }
@@ -351,7 +348,7 @@ void VulkanContext::RecreateSwapchain() {
 // Shared by RenderFrame() and RenderOffscreenFrame(); see the header comment. Must run between
 // vkCmdBeginCommandBuffer and the caller's own barriers/vkCmdEndCommandBuffer.
 void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent,
-                                    const SceneViewport* vp) {
+                                    const SceneViewport* vp, float zoom, bool keepShapes) {
     const bool msaa = resolveView != VK_NULL_HANDLE;
     VkRenderingAttachmentInfo att{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -386,7 +383,7 @@ void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveVie
         vkCmdSetViewport(cb, 0, 1, &viewport);
         vkCmdSetScissor(cb, 0, 1, &scissor);
 
-        float invScreen[2] = { 2.0f / vw, 2.0f / vh };
+        float invScreen[2] = { 2.0f * zoom / vw, 2.0f * zoom / vh };
 
         if (!circles.empty()) {
             const uint32_t n = (uint32_t)circles.size();
@@ -407,8 +404,56 @@ void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveVie
         }
     }
     vkCmdEndRendering(cb);
-    circles.clear();
-    rects.clear();
+    if (!keepShapes) {
+        circles.clear();
+        rects.clear();
+    }
+}
+
+void VulkanContext::RecordOffscreenCapture(int captureSlot, bool keepShapes) {
+    VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    VkImageMemoryBarrier toRender{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = offscreenEverRendered ? VK_ACCESS_TRANSFER_READ_BIT : VkAccessFlags(0),
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        // Every frame after the first starts in TRANSFER_SRC_OPTIMAL (left by its capture copy).
+        .oldLayout = offscreenEverRendered ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = offscreenImage, .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, offscreenEverRendered ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRender);
+    offscreenEverRendered = true;
+
+    // Always from UNDEFINED, as with RenderFrame()'s swapchainMsaaImage barrier.
+    if (sceneSampleCount != VK_SAMPLE_COUNT_1_BIT) {
+        VkImageMemoryBarrier msaaToRender{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .image = offscreenMsaaImage, .subresourceRange = range,
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &msaaToRender);
+    }
+
+    RecordScenePass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? offscreenMsaaView : offscreenView,
+                    sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? offscreenView : VK_NULL_HANDLE,
+                    offscreenExtent, nullptr, 1.f, keepShapes);
+
+    VkImageMemoryBarrier toTransferSrc{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .image = offscreenImage, .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransferSrc);
+
+    VkBufferImageCopy region{
+        .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageOffset = { 0, 0, 0 }, .imageExtent = { offscreenExtent.width, offscreenExtent.height, 1 },
+    };
+    vkCmdCopyImageToBuffer(cb, offscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffers_[captureSlot], 1, &region);
 }
 
 void VulkanContext::EnsureOffscreenTarget(uint32_t w, uint32_t h) {
@@ -585,7 +630,7 @@ void VulkanContext::AddRectOutline(float cx, float cy, float halfWidth, float ha
     rects.push_back({ color.r, color.g, color.b, color.a, cx, cy, halfWidth, halfHeight, borderThickness, 0.f, 0.f, 0.f });
 }
 
-bool VulkanContext::StartRecording(const std::string& outputPath, int fps, float lengthSeconds) {
+bool VulkanContext::StartRecording(const std::string& outputPath, int fps, float lengthSeconds, int width, int height) {
     if (recorder_.IsActive()) StopRecording();
 
     const char* pixelFormat;
@@ -598,8 +643,13 @@ bool VulkanContext::StartRecording(const std::string& outputPath, int fps, float
         return false;
     }
 
-    recordWidth_  = swapchainExtent.width;
-    recordHeight_ = swapchainExtent.height;
+    if (width < 2 || height < 2) {
+        std::cerr << "Recorder: invalid recording resolution " << width << "x" << height << "\n";
+        return false;
+    }
+    recordWidth_  = static_cast<uint32_t>(width);
+    recordHeight_ = static_cast<uint32_t>(height);
+    EnsureOffscreenTarget(recordWidth_, recordHeight_);
     captureBufferSize_ = VkDeviceSize(recordWidth_) * recordHeight_ * 4;
     for (int i = 0; i < kCaptureSlots; i++) {
         CreateSSBO(captureBufferSize_, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
@@ -691,7 +741,7 @@ void VulkanContext::RenderFrame(float dt) {
 
     // Paces captured frames against `dt` rather than the call rate, so the video's duration matches
     // accumulated `dt`. Only applies while captureFromSwapchain_ is set; during batch rendering this
-    // is called only to refresh the overlay and capturing would splice in a blank frame.
+    // is called only to refresh the overlay and capturing would splice in a duplicate frame.
     bool capturingThisFrame = false;
     bool stopRecordingAfterSubmit = false;
     int  captureSlot = -1;
@@ -736,42 +786,21 @@ void VulkanContext::RenderFrame(float dt) {
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &msaaToRender);
     }
 
-    // Pass 1: the simulated scene only. It ends and is captured before ImGui draws, so UI overlays
-    // never reach the recorded video. With MSAA it resolves from swapchainMsaaImage into
-    // imageViews[imageIndex].
-    RecordScenePass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? swapchainMsaaView : imageViews[imageIndex],
-                    sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? imageViews[imageIndex] : VK_NULL_HANDLE,
-                    swapchainExtent, UsesSceneViewport() ? &sceneViewport_ : nullptr);
-
+    // The video frame: the scene alone, drawn at the recording's own resolution into the offscreen
+    // target (so it is independent of the window and the view's zoom) and copied out. The shapes
+    // are kept for the on-screen pass below.
     if (capturingThisFrame) {
-        VkImageMemoryBarrier toTransferSrc{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .image = images[imageIndex], .subresourceRange = range,
-        };
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransferSrc);
-
-        VkBufferImageCopy region{
-            .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
-            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .imageOffset = { 0, 0, 0 }, .imageExtent = { recordWidth_, recordHeight_, 1 },
-        };
-        vkCmdCopyImageToBuffer(cb, images[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffers_[captureSlot], 1, &region);
-
-        // Back to COLOR_ATTACHMENT_OPTIMAL, not PRESENT_SRC: pass 2 (ImGui) still draws into it.
-        VkImageMemoryBarrier backToColor{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .image = images[imageIndex], .subresourceRange = range,
-        };
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &backToColor);
-
+        RecordOffscreenCapture(captureSlot, /*keepShapes=*/true);
         pendingCaptureSlot_ = captureSlot;
     }
 
-    // Pass 2: ImGui on top, drawn after pass 1 was captured so it never reaches the video.
+    // Pass 1: the simulated scene, scaled to fit the view. With MSAA it resolves from
+    // swapchainMsaaImage into imageViews[imageIndex].
+    RecordScenePass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? swapchainMsaaView : imageViews[imageIndex],
+                    sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? imageViews[imageIndex] : VK_NULL_HANDLE,
+                    swapchainExtent, ActiveViewport(), SceneZoom());
+
+    // Pass 2: ImGui on top.
     VkRenderingAttachmentInfo uiAtt{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = imageViews[imageIndex], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -822,8 +851,18 @@ void VulkanContext::RenderOffscreenFrame() {
     // Unlike live capture, batch mode must produce exactly one frame per call, since
     // AdvanceRendering steps the sim by a fixed dt per call and the video length depends on that.
     // So if the encoder is behind, block until it frees a slot rather than skip the frame.
-    while (captureSlotBusy_[captureWriteIndex_].load())
+    // TEMP-DEBUG: bounded wait; on timeout log slot state and abort the recording instead of hanging.
+    const auto dbgWaitStart = std::chrono::steady_clock::now();
+    while (captureSlotBusy_[captureWriteIndex_].load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (std::chrono::steady_clock::now() - dbgWaitStart > std::chrono::seconds(10)) {
+            std::cerr << "[rec-dbg] capture slot wait timed out: writeIndex=" << captureWriteIndex_
+                      << " busy=[" << captureSlotBusy_[0].load() << captureSlotBusy_[1].load() << captureSlotBusy_[2].load()
+                      << "] recordedFrames=" << recordedFrames_ << " - aborting recording\n";
+            StopRecording();
+            return;
+        }
+    }
     const int captureSlot = captureWriteIndex_;
     captureWriteIndex_ = (captureWriteIndex_ + 1) % kCaptureSlots;
     captureSlotBusy_[captureSlot] = true;
@@ -836,49 +875,7 @@ void VulkanContext::RenderOffscreenFrame() {
     VkCommandBufferBeginInfo cbbi{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     chk(vkBeginCommandBuffer(cb, &cbbi));
 
-    VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    VkImageMemoryBarrier toRender{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = offscreenEverRendered ? VK_ACCESS_TRANSFER_READ_BIT : VkAccessFlags(0),
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        // Every frame after the first starts in TRANSFER_SRC_OPTIMAL (left by its capture copy).
-        .oldLayout = offscreenEverRendered ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .image = offscreenImage, .subresourceRange = range,
-    };
-    vkCmdPipelineBarrier(cb, offscreenEverRendered ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRender);
-    offscreenEverRendered = true;
-
-    // Always from UNDEFINED, as with RenderFrame()'s swapchainMsaaImage barrier.
-    if (sceneSampleCount != VK_SAMPLE_COUNT_1_BIT) {
-        VkImageMemoryBarrier msaaToRender{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .image = offscreenMsaaImage, .subresourceRange = range,
-        };
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &msaaToRender);
-    }
-
-    RecordScenePass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? offscreenMsaaView : offscreenView,
-                    sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? offscreenView : VK_NULL_HANDLE,
-                    offscreenExtent);
-
-    VkImageMemoryBarrier toTransferSrc{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        .image = offscreenImage, .subresourceRange = range,
-    };
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransferSrc);
-
-    VkBufferImageCopy region{
-        .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageOffset = { 0, 0, 0 }, .imageExtent = { offscreenExtent.width, offscreenExtent.height, 1 },
-    };
-    vkCmdCopyImageToBuffer(cb, offscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffers_[captureSlot], 1, &region);
+    RecordOffscreenCapture(captureSlot, /*keepShapes=*/false);
 
     chk(vkEndCommandBuffer(cb));
 

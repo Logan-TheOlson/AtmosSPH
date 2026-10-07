@@ -6,8 +6,13 @@
 #include <string>
 #include <vector>
 
-// Simulation container half-extents, as a fraction of the window's half-extents.
+// Simulation container half-extents, as a fraction of the simulated area's half-extents.
 struct SceneBoundary {
+    // The simulated area in pixels: the world every other pixel value in the scene lives in, and
+    // the resolution recordings are saved at (kept even, for the encoder). The window only shows
+    // it scaled to fit. Change it through SetSceneResolution so the layout scales along.
+    int   resWidth   = Config::WindowWidth;
+    int   resHeight  = Config::WindowHeight;
     float widthFrac  = 1.0f;
     float heightFrac = 1.0f;
     // Absolute half-extents in simulation pixels. When > 0, each overrides its *Frac above, making
@@ -15,7 +20,7 @@ struct SceneBoundary {
     float halfWidthPx  = 0.f;
     float halfHeightPx = 0.f;
     // If set, a particle crossing the left/right wall teleports to the other side (velocity
-    // untouched) instead of bouncing. main.cpp also mirrors particles across the seam (see
+    // untouched) instead of bouncing. Sph.cpp also mirrors particles across the seam (see
     // ForEachPeriodicX) so density/pressure near it match an infinite domain.
     bool  periodicX  = false;
 };
@@ -48,7 +53,7 @@ struct SceneGravity {
     bool          validate         = false; // periodically compares the active method against brute-force on a small sample
 };
 
-// Which pressure-from-density law main.cpp's CalculatePressure applies.
+// Which pressure-from-density law Sph.cpp's CalculatePressure applies.
 enum class EosModel {
     // Becker-Teschner weakly-compressible SPH: pressure = stiffness*targetDensity/exponent *
     // ((density/targetDensity)^exponent - 1), clamped to >=0.
@@ -57,7 +62,7 @@ enum class EosModel {
     Polytropic,
 };
 
-// Which viscous force main.cpp's CalculatePressureForce applies between particle pairs.
+// Which viscous force Sph.cpp's CalculatePressureForce applies between particle pairs.
 enum class ViscosityModel {
     // Monaghan artificial viscosity: a pressure-like term along the pair axis for approaching
     // pairs, set by `viscosity` (alpha) and `viscosityQuadratic` (beta). The effective kinematic
@@ -130,31 +135,6 @@ struct SceneEvent {
     bool  fade      = false;             // Field only: full strength at the center, falling to 0 at the edge
 };
 
-// Field acceleration at (px, py) for a Field-mode event; false if outside the area. Zero at the center.
-inline bool EventFieldAccel(const SceneEvent& e, float px, float py, float& ax, float& ay) {
-    const float dx = px - e.cx, dy = py - e.cy;
-    float edge; // 0 at the center -> 1 at the boundary
-    if (e.shape == EventShape::Circle) {
-        const float d2 = dx * dx + dy * dy;
-        if (d2 > e.radius * e.radius) return false;
-        edge = e.radius > 0.f ? std::sqrt(d2) / e.radius : 0.f;
-    } else {
-        if (std::fabs(dx) > e.halfW || std::fabs(dy) > e.halfH) return false;
-        edge = std::max(e.halfW > 0.f ? std::fabs(dx) / e.halfW : 0.f, e.halfH > 0.f ? std::fabs(dy) / e.halfH : 0.f);
-    }
-    ax = ay = 0.f;
-    const float dist = std::sqrt(dx * dx + dy * dy);
-    if (dist < 1e-4f) return true;
-    const float mag = e.strength * (e.fade ? 1.f - edge : 1.f);
-    const float ux = dx / dist, uy = dy / dist;
-    switch (e.fieldKind) {
-        case FieldKind::Curl:    ax = -uy * mag; ay =  ux * mag; break;
-        case FieldKind::Attract: ax = -ux * mag; ay = -uy * mag; break;
-        case FieldKind::Repel:   ax =  ux * mag; ay =  uy * mag; break;
-    }
-    return true;
-}
-
 // A persistent-color patch: particles spawned inside it keep `color` for the run unless a live
 // color-by mode overrides it. World pixels, as SceneEvent. Later regions win overlaps.
 struct SceneColorRegion {
@@ -166,7 +146,7 @@ struct SceneColorRegion {
 };
 
 // A solid obstacle: nothing spawns inside it, particles bounce off it, and it mirrors particles
-// for SPH density (main.cpp's ForEachObstacleGhost). World pixels, as SceneEvent.
+// for SPH density (Sph.cpp's ForEachObstacleGhost). World pixels, as SceneEvent.
 struct SceneObstacle {
     EventShape shape = EventShape::Circle;
     float cx = 0.f, cy = 0.f;
@@ -174,36 +154,6 @@ struct SceneObstacle {
     float halfW = 100.f, halfH = 100.f;  // Rect
     Color color = { 0.55f, 0.58f, 0.65f, 1.f };
 };
-
-// Signed distance from (x, y) to the obstacle's surface (negative inside) and the outward unit
-// normal. Callers treat `sd < margin` as touching.
-inline float ObstacleSurface(const SceneObstacle& o, float x, float y, float& nx, float& ny) {
-    const float dx = x - o.cx, dy = y - o.cy;
-    if (o.shape == EventShape::Circle) {
-        const float d = std::sqrt(dx * dx + dy * dy);
-        if (d > 1e-6f) { nx = dx / d; ny = dy / d; }
-        else           { nx = 0.f;    ny = 1.f; }
-        return d - o.radius;
-    }
-    const float qx = std::fabs(dx) - o.halfW, qy = std::fabs(dy) - o.halfH;
-    const float sx = dx < 0.f ? -1.f : 1.f, sy = dy < 0.f ? -1.f : 1.f;
-    if (qx > 0.f || qy > 0.f) {
-        const float ox = std::max(qx, 0.f), oy = std::max(qy, 0.f);
-        const float d  = std::sqrt(ox * ox + oy * oy);
-        nx = sx * ox / d; ny = sy * oy / d;
-        return d;
-    }
-    if (qx > qy) { nx = sx;  ny = 0.f; return qx; }
-    nx = 0.f; ny = sy; return qy;
-}
-
-// True if a point (grown by `margin`, e.g. the particle radius) lies inside any obstacle.
-inline bool InsideAnyObstacle(const std::vector<SceneObstacle>& obstacles, float x, float y, float margin = 0.f) {
-    float nx, ny;
-    for (const SceneObstacle& o : obstacles)
-        if (ObstacleSurface(o, x, y, nx, ny) < margin) return true;
-    return false;
-}
 
 // A block of starting particles: a square lattice filling a rect, or a Fibonacci-spiral disk for a
 // circle, at spacing 3 * circleRadius * spacingScale. A Scene with `useGroups` spawns exactly its
@@ -214,132 +164,11 @@ struct SceneGroup {
     float radius = 100.f;                // Circle
     float halfW = 100.f, halfH = 100.f;  // Rect
     float spacingScale = 1.f;            // < 1 packs tighter, like SceneSpawn::spacingScale
+    bool  fixSize = false;               // Rect: the box is sized to fit cols x rows particles
+    int   cols = 10, rows = 10;          // used when fixSize
     bool  customColor = false;           // false: the scene's particle color (particles.circleColor)
     Color color = { 0.2f, 0.6f, 1.0f, 1.0f };
 };
-
-inline constexpr int MaxSpawnParticles = 1'000'000; // per group; keeps typos from allocating gigabytes
-
-inline float GroupSpacing(const SceneGroup& g, float circleRadius) {
-    return circleRadius * 3.f * std::max(g.spacingScale, 0.1f);
-}
-
-// Lattice dimensions of a rect group (0 x 0 if the rect is empty or the spacing degenerate).
-inline void GroupGrid(const SceneGroup& g, float spacing, int& nx, int& ny) {
-    nx = ny = 0;
-    if (!(spacing > 0.f) || !(g.halfW > 0.f) || !(g.halfH > 0.f)) return;
-    // +1e-3 so a block sized as exactly N spacings isn't rounded down to N-1 by float error.
-    const float fx = 2.f * g.halfW / spacing + 1e-3f, fy = 2.f * g.halfH / spacing + 1e-3f;
-    if (!std::isfinite(fx) || !std::isfinite(fy)) return;
-    nx = std::clamp(static_cast<int>(std::min(fx, static_cast<float>(MaxSpawnParticles))), 1, MaxSpawnParticles);
-    ny = std::clamp(static_cast<int>(std::min(fy, static_cast<float>(MaxSpawnParticles))), 1, MaxSpawnParticles / nx);
-}
-
-inline int GroupCircleCount(const SceneGroup& g, float spacing) {
-    if (!(spacing > 0.f) || !(g.radius > 0.f)) return 0;
-    const float c = 3.14159265f * g.radius * g.radius / (spacing * spacing) + 0.5f;
-    return std::isfinite(c) ? static_cast<int>(std::min(c, static_cast<float>(MaxSpawnParticles))) : 0;
-}
-
-inline int GroupParticleCount(const SceneGroup& g, float spacing) {
-    if (g.shape == EventShape::Circle) return GroupCircleCount(g, spacing);
-    int nx, ny;
-    GroupGrid(g, spacing, nx, ny);
-    return nx * ny;
-}
-
-// Resizes the group (keeping center, shape and a rect's aspect ratio) to hold about `count`
-// particles at `spacing`.
-inline void ResizeGroupToCount(SceneGroup& g, float spacing, int count) {
-    if (!(spacing > 0.f)) return;
-    count = std::clamp(count, 1, MaxSpawnParticles);
-    const float area = static_cast<float>(count) * spacing * spacing; // one particle per spacing^2
-    if (g.shape == EventShape::Circle) {
-        g.radius = std::sqrt(area / 3.14159265f);
-    } else {
-        const float aspect = (g.halfW > 0.f && g.halfH > 0.f) ? g.halfW / g.halfH : 1.f;
-        g.halfH = 0.5f * std::sqrt(area / aspect);
-        g.halfW = g.halfH * aspect;
-    }
-}
-
-// Calls fn(x, y) for every particle position of the group at `spacing`.
-template <typename Fn>
-inline void ForEachGroupPoint(const SceneGroup& g, float spacing, Fn&& fn) {
-    if (g.shape == EventShape::Circle) {
-        // Fibonacci (Vogel) spiral: exactly `count` particles at areal density 1 / spacing^2.
-        const int   count = GroupCircleCount(g, spacing);
-        constexpr float GoldenAngle = 2.39996323f; // pi * (3 - sqrt(5))
-        for (int i = 0; i < count; i++) {
-            const float r     = g.radius * std::sqrt((static_cast<float>(i) + 0.5f) / static_cast<float>(count));
-            const float theta = static_cast<float>(i) * GoldenAngle;
-            fn(g.cx + r * std::cos(theta), g.cy + r * std::sin(theta));
-        }
-        return;
-    }
-    int nx, ny;
-    GroupGrid(g, spacing, nx, ny);
-    const float startX = g.cx - static_cast<float>(nx - 1) * spacing * 0.5f;
-    const float startY = g.cy - static_cast<float>(ny - 1) * spacing * 0.5f;
-    for (int x = 0; x < nx; x++)
-        for (int y = 0; y < ny; y++)
-            fn(startX + static_cast<float>(x) * spacing, startY + static_cast<float>(y) * spacing);
-}
-
-// Blends SceneColorRegions into `out` (which must hold the color the point would otherwise have).
-//  * Color: a gradient between the areas' centers, each weighted by reach / distance-to-center.
-//    Where areas overlap, only the topmost (last) takes part.
-//  * Coverage: that color is solid inside the areas' footprint and fades linearly back to `out`
-//    over a band beyond the edge.
-// `strength` (0..1) scales how far the gradient replaces an area's flat color and how much of the
-// edge fade applies (0 = hard-edged patches). `radius` (px) is the band width; <= 0 = 50% of the
-// area's smaller half-size. Returns false (out untouched) for points no area reaches.
-inline bool BlendColorRegions(const std::vector<SceneColorRegion>& regions, float x, float y, Color& out,
-                              float strength = 1.f, float radius = 0.f) {
-    auto edgeDist = [&](const SceneColorRegion& r, float& size) {
-        const float dx = x - r.cx, dy = y - r.cy;
-        if (r.shape == EventShape::Circle) {
-            size = r.radius;
-            return std::max(std::sqrt(dx * dx + dy * dy) - r.radius, 0.f);
-        }
-        size = std::min(r.halfW, r.halfH);
-        const float ex = std::max(std::fabs(dx) - r.halfW, 0.f), ey = std::max(std::fabs(dy) - r.halfH, 0.f);
-        return std::sqrt(ex * ex + ey * ey);
-    };
-    strength = std::clamp(strength, 0.f, 1.f);
-    int top = -1;  // topmost area containing the point
-    for (int i = 0; i < static_cast<int>(regions.size()); i++) {
-        float size;
-        if (edgeDist(regions[static_cast<size_t>(i)], size) <= 0.f) top = i;
-    }
-    float sr = 0.f, sg = 0.f, sb = 0.f, sa = 0.f, sw = 0.f, cover = 0.f;
-    for (int i = 0; i < static_cast<int>(regions.size()); i++) {
-        const SceneColorRegion& r = regions[static_cast<size_t>(i)];
-        float size;
-        const float d = edgeDist(r, size);
-        if (d <= 0.f && i != top) continue;  // covered by a region above it
-        // Each area's reach is its own (independent of the other areas): solid inside, linear fade over `band`.
-        const float band = radius > 0.f ? radius : std::max(size * 0.5f, 1.f);
-        const float c = d <= 0.f ? 1.f : std::clamp(1.f - d / band, 0.f, 1.f) * strength;
-        if (c <= 0.f) continue;
-        // Colors mix by reach / distance-to-center, so an area only tints points it actually reaches and,
-        // where reaches overlap, the colors gradient between the centers.
-        const float w = c / std::max(std::hypot(x - r.cx, y - r.cy), 1.f);
-        sr += r.color.r * w; sg += r.color.g * w; sb += r.color.b * w; sa += r.color.a * w; sw += w;
-        cover = std::max(cover, c);
-    }
-    if (sw <= 0.f || cover <= 0.f) return false;
-    const float inv = 1.f / sw;
-    Color grad = { sr * inv, sg * inv, sb * inv, sa * inv };
-    if (top >= 0) {  // inside: strength picks between the area's flat color and the gradient
-        const Color& flat = regions[static_cast<size_t>(top)].color;
-        grad = { flat.r + (grad.r - flat.r) * strength, flat.g + (grad.g - flat.g) * strength,
-                 flat.b + (grad.b - flat.b) * strength, flat.a + (grad.a - flat.a) * strength };
-    }
-    out = { out.r + (grad.r - out.r) * cover, out.g + (grad.g - out.g) * cover,
-            out.b + (grad.b - out.b) * cover, out.a + (grad.a - out.a) * cover };
-    return true;
-}
 
 // A persistent-color pattern laid over the spawn block; SceneColorRegions win where they overlap.
 enum class ColorPatternKind { None, VStripes, HStripes, Checker, Rings, Gradient, Image };
@@ -376,6 +205,21 @@ struct Scene {
     float blendRadius       = 0.f;   // px: distance the gradient reaches; 0 = automatic
     SceneColorPattern colorPattern;
 };
+
+// The container's half-extents in simulation pixels.
+inline float ContainerHalfWidth(const SceneBoundary& b)  { return b.halfWidthPx  > 0.f ? b.halfWidthPx  : 0.5f * static_cast<float>(b.resWidth)  * b.widthFrac; }
+inline float ContainerHalfHeight(const SceneBoundary& b) { return b.halfHeightPx > 0.f ? b.halfHeightPx : 0.5f * static_cast<float>(b.resHeight) * b.heightFrac; }
+
+// Rescales the size-dependent SPH constants (smoothing radius, target density, stiffness,
+// kinematic viscosity) from p.circleRadius so the fluid behaves like SceneParticles' defaults at
+// any particle size: h and the lattice spacing scale together, density as 1/size^2, and stiffness
+// (sound speed^2) and viscosity as size^2 so the CFL number at a fixed substep count is unchanged.
+void AutoTuneSph(SceneParticles& p);
+
+// Resizes the simulated area (clamped, and made even) and scales everything laid out in it to
+// match: groups, obstacles, events, color areas, absolute container sizes and the spawn grid
+// (unless it fills the boundary). Particle and kernel sizes are physical and stay.
+void SetSceneResolution(Scene& scene, int width, int height);
 
 extern const std::vector<Scene> ScenePresets;
 

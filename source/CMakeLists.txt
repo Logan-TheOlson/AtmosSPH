@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 set(NAME Stjarna)
 project(${NAME})
 
+# Single-config generators (Makefiles/Ninja) default to an unoptimized build; make Release the default.
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 include(FetchContent)
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui
@@ -102,7 +107,12 @@ target_link_libraries(imgui_lib PUBLIC volk PRIVATE ${SDL_LIBRARY})
 
 add_executable(${NAME}
     src/main.cpp
+    src/physics/Sph.cpp
     src/engine/Engine.cpp
+    src/engine/EngineSim.cpp
+    src/engine/EngineUi.cpp
+    src/engine/EnginePanels.cpp
+    src/engine/ProfileLogger.cpp
     src/engine/Object.cpp
     src/engine/Scene.cpp
     src/engine/ScenePresetIO.cpp
@@ -132,6 +142,13 @@ if (WIN32)
 endif()
 set_target_properties(${NAME} PROPERTIES DEBUGGER_WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(${NAME} PRIVATE cxx_std_20)
+# Optimize the simulation hot path. -march=native ties the binary to this CPU; -ffast-math is
+# deliberately left off because CellCoord and the solver rely on std::isfinite/NaN handling.
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${NAME} PRIVATE $<$<CONFIG:Release>:-O3 -march=native>)
+elseif (MSVC)
+    target_compile_options(${NAME} PRIVATE $<$<CONFIG:Release>:/O2 /arch:AVX2>)
+endif()
 target_link_libraries(${NAME} PRIVATE ${SDL_LIBRARY} imgui_lib volk)
 add_dependencies(${NAME} Shaders Fonts)
 
