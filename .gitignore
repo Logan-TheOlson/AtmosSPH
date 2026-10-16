@@ -242,3 +242,21 @@ tutorial/.github/**
 
 # CLion build directories
 cmake-build-*/
+
+
+# Exclude generated simulations, frame pipelines, and tracking metrics
+source/bin/recordings/
+source/bin/data/
+recordings/
+data/
+
+# Failsafe protection against accidental heavy media commits
+*.mp4
+*.csv
+
+# Explicitly ignore root source build generation directories
+source/cmake-build-release/
+source/cmake-build-debug/
+
+# AI Assistant Context Configurations
+.claude/
